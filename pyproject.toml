@@ -1,0 +1,17 @@
+[project]
+name = "torch-trace-lab"
+version = "0.1.0"
+description = "Presentation materials for a SHARCNET General Interest Seminar on PyTorch Profiler and Holistic Trace Analysis, November 18, 2026."
+readme = "README.md"
+authors = [
+    { name = "Collin Wilson", email = "39131920+cwilson51@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]  
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
