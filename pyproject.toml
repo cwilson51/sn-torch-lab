@@ -7,7 +7,17 @@ authors = [
     { name = "Collin Wilson", email = "39131920+cwilson51@users.noreply.github.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "holistictraceanalysis>=0.5.0",
+    "jupyterlab>=4.6.6",
+    "torch>=2.15.0",
+    "torchvision>=0.29.2",
+]
+
+[project.optional-dependencies]
+presentation = [
+    "jupyterlab-rise>=0.43.1",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]  
