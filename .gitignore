@@ -9,3 +9,5 @@ wheels/
 # Virtual environments
 .venv
 .python-version
+**/.DS_Store
+**/.ipynb_checkpoints
