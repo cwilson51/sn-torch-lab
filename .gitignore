@@ -11,3 +11,13 @@ wheels/
 .python-version
 **/.DS_Store
 **/.ipynb_checkpoints
+
+# Claude Code / agent config
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+docs/agents/
+GLOSSARY.md
+GLOSSARY-MAP.md
+docs/adr/
+.scratch/
