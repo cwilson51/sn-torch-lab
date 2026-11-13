@@ -1,0 +1,34 @@
+.reveal { background: url("images/content-bg.svg") center / 100% 100% no-repeat; }
+
+/* Full-screen background when the current slide contains .content-slide */
+.reveal:has(section.present:not(.stack) .title-slide) {
+  background: url("images/title-bg.svg") center / 100% 100% no-repeat;
+}
+
+.reveal .slide-number {
+  font-size: 18px;
+  background: transparent;
+  color: #333;
+  right: 10px;
+  bottom: 10px;
+}
+
+ul.big > li {
+  font-size: 1.5em;   /* typical h2 size */
+  font-weight: bold;
+}
+ul.big > li::marker {
+  font-size: 1em;     /* marker inherits li size; adjust if needed */
+}
+
+.reveal .slides,
+.reveal .slides section,
+.reveal .jp-Notebook,
+.reveal .jp-Cell,
+.reveal .jp-Cell-inputWrapper,
+.reveal .jp-Cell-outputWrapper,
+.reveal .jp-InputArea-editor,
+.reveal .jp-RenderedHTMLCommon,
+.reveal .jp-OutputArea-output {
+  background: transparent !important;
+}
