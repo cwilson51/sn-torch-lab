@@ -113,6 +113,13 @@ def test_egress_guard(url):
         brine.Client(KEY, url=url, session=FakeSession())
 
 
+def test_base_url_comes_from_env_only():
+    assert brine.base_url({"BRINE_BASE_URL": "https://brine.sharcnet.ca/v1/"}) == \
+        "https://brine.sharcnet.ca/v1"
+    with pytest.raises(BrineError, match="BRINE_BASE_URL is not set"):
+        brine.base_url({})
+
+
 def test_key_from_env_wins(tmp_path):
     assert brine.load_key({"BRINE_API_KEY": KEY}, str(tmp_path / "none")) == KEY
 

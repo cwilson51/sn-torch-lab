@@ -64,6 +64,10 @@ def torch_lab_metadata(args, device_type: str) -> dict:
         precision = "fp16-amp" if device_type == "cuda" else "bf16-amp"
     elif args.compile and device_type == "cuda":
         precision = "tf32"  # --compile sets float32 matmul precision to "high"
+    elif device_type == "cuda":
+        # Matmuls stay fp32, but cuDNN convolutions use TF32 by default
+        # (torch.backends.cudnn.allow_tf32 is True).
+        precision = "fp32 (TF32 convs)"
     else:
         precision = "fp32"
     return {

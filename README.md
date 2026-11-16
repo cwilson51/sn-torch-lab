@@ -126,7 +126,14 @@ You can also pass a single trace file, or two or more run directories (`torch-la
 | `--model NAME` | Brine model (default: `$TORCH_LAB_BRINE_MODEL`, `$BRINE_MODEL`, or `DeepSeek-V4-Flash-0731`). |
 | `--no-llm` | Write the bundle, prompt, and a flags-only report without calling Brine. |
 
-**Brine API key.** Each user needs their own Brine key. Set `BRINE_API_KEY`, or store the key in `~/.config/torch-lab/brine_key` with `chmod 600`. The key is never written to any output. If the key is missing, Brine can't be reached, or the call fails, the bundle, prompt and a flags-only report are still written and the command exits with status 1.
+**Brine settings.** Set the Brine endpoint and your own API key before running without `--no-llm`:
+
+```
+export BRINE_BASE_URL=https://brine.sharcnet.ca/v1
+export BRINE_API_KEY=...   # or store it in ~/.config/torch-lab/brine_key with chmod 600
+```
+
+There is no built-in default URL. For safety, the URL must use https to an allowed host (`brine.sharcnet.ca`); anything else is refused. The key is never written to any output. If the URL or key is missing, Brine can't be reached, or the call fails, the bundle, prompt and a flags-only report are still written and the command exits with status 1.
 
 **What is sent to Brine.** Only aggregated tables (per-step times, top kernels, idle breakdown, flags) and allowlisted run facts (GPU model, precision, batch size, ...). Raw traces, file paths, usernames, hostnames, job IDs and Slurm data are never sent. Before every call a leak check scans the prompt for your username, home directory, cluster paths, hostname, Slurm values and account names, and blocks the call if it finds any. **`--run-note` text and run directory names are sent as written, so keep sensitive information out of them.** Check `prompt.md` to see exactly what was sent.
 
@@ -174,7 +181,7 @@ data["torch_lab"] = {
     "batch_size_per_gpu": 64,
     "dataloader_workers": 8,
     "torch_compile": False,
-    "precision": "bf16-amp",  # fp32 | tf32 | fp16-amp | bf16-amp
+    "precision": "bf16-amp",  # fp32 | fp32 (TF32 convs) | tf32 | fp16-amp | bf16-amp
 }
 trace.write_text(json.dumps(data))
 ```

@@ -31,9 +31,17 @@ class Completion:
     model: str
 
 
+URL_HELP = ("Set BRINE_BASE_URL to the Brine API endpoint, e.g. "
+            "export BRINE_BASE_URL=https://brine.sharcnet.ca/v1")
+
+
 def base_url(environ=None) -> str:
+    """The Brine endpoint from BRINE_BASE_URL. There is no built-in default."""
     environ = os.environ if environ is None else environ
-    return environ.get("BRINE_BASE_URL", settings.BRINE_BASE_URL).rstrip("/")
+    url = environ.get("BRINE_BASE_URL", "").strip().rstrip("/")
+    if not url:
+        raise BrineError(f"BRINE_BASE_URL is not set. {URL_HELP}")
+    return url
 
 
 def model_name(cli_model: str | None, environ=None) -> str:
@@ -48,7 +56,7 @@ def check_egress(url: str) -> None:
     if parsed.scheme != "https" or parsed.hostname not in settings.ALLOWED_HOSTS:
         raise BrineError(f"Refusing to send data to {parsed.scheme}://{parsed.hostname}: only "
                          f"https to {', '.join(sorted(settings.ALLOWED_HOSTS))} is allowed. "
-                         "Unset BRINE_BASE_URL to use the default.")
+                         "Check BRINE_BASE_URL.")
 
 
 def load_key(environ=None, key_file: str | None = None) -> str:

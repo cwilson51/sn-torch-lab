@@ -29,9 +29,32 @@ def two_runs(tmp_path):
 @pytest.fixture
 def fake_brine(monkeypatch):
     """Patch requests.Session used by the Brine client; returns the fake session."""
+    monkeypatch.setenv("BRINE_BASE_URL", BRINE_URL)
     session = FakeSession(models("DeepSeek-V4-Flash-0731"), completion("## Summary\nLLM says hi"))
     monkeypatch.setattr(brine.requests, "Session", lambda: session)
     return session
+
+
+BRINE_URL = "https://brine.sharcnet.ca/v1"
+
+
+def test_missing_base_url_writes_outputs_and_exits_1(monkeypatch, two_runs, tmp_path, fake_brine):
+    monkeypatch.delenv("BRINE_BASE_URL")
+    monkeypatch.setenv("BRINE_API_KEY", KEY)
+    out = tmp_path / "out"
+    assert run(two_runs, "--output-dir", out) == 1
+    assert "BRINE_BASE_URL is not set" in (out / "report.md").read_text()
+    assert (out / "bundle.md").exists() and (out / "prompt.md").exists()
+    assert fake_brine.calls == []
+
+
+def test_disallowed_base_url_is_refused(monkeypatch, two_runs, tmp_path, fake_brine):
+    monkeypatch.setenv("BRINE_BASE_URL", "https://api.example.com/v1")
+    monkeypatch.setenv("BRINE_API_KEY", KEY)
+    out = tmp_path / "out"
+    assert run(two_runs, "--output-dir", out) == 1
+    assert "Refusing to send" in (out / "report.md").read_text()
+    assert fake_brine.calls == []
 
 
 def run(*args):
@@ -103,6 +126,7 @@ def test_missing_key_writes_outputs_and_exits_1(two_runs, tmp_path, fake_brine, 
 def test_unreachable_brine_writes_outputs_and_exits_1(monkeypatch, two_runs, tmp_path):
     import requests
     monkeypatch.setenv("BRINE_API_KEY", KEY)
+    monkeypatch.setenv("BRINE_BASE_URL", BRINE_URL)
     session = FakeSession(*[requests.ConnectionError()] * 3)
     monkeypatch.setattr(brine.requests, "Session", lambda: session)
     monkeypatch.setattr(brine.time, "sleep", lambda s: None)

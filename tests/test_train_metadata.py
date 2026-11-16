@@ -6,7 +6,8 @@ from torch_trace_lab import train
 
 
 @pytest.mark.parametrize("flags, device, precision", [
-    ([], "cuda", "fp32"),
+    ([], "cuda", "fp32 (TF32 convs)"),
+    ([], "cpu", "fp32"),
     (["--compile"], "cuda", "tf32"),
     (["--compile", "--amp"], "cuda", "fp16-amp"),
     (["--amp"], "cpu", "bf16-amp"),
