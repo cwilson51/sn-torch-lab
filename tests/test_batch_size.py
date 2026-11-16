@@ -32,6 +32,29 @@ def test_respects_cap():
     assert bs.largest_fitting(peak_per_image(1), float("inf"), candidates) == 512
 
 
+def test_skips_size_predicted_over_budget():
+    tried = []
+
+    def step(n):
+        tried.append(n)
+        if n > 64:
+            raise torch.OutOfMemoryError("should have been predicted")
+        return 1000 + 100 * n
+
+    budget = 1000 + 100 * 64 + 50
+    assert bs.largest_fitting(step, budget, bs.powers_of_two(8, 512)) == 64
+    assert tried == [8, 16, 32, 64]
+
+
+def test_low_estimate_falls_back_to_oom():
+    def step(n):
+        if n > 64:
+            raise torch.OutOfMemoryError("out of memory")
+        return 100 * n
+
+    assert bs.largest_fitting(step, float("inf"), bs.powers_of_two(8, 512)) == 64
+
+
 def test_nothing_fits():
     assert bs.largest_fitting(peak_per_image(100), 10, bs.powers_of_two(8, 512)) is None
 

@@ -45,9 +45,21 @@ def largest_fitting(
     ``try_step(batch_size)`` returns the peak bytes used by one training step, or raises
     ``torch.OutOfMemoryError``. Candidates are tried in increasing order and the search
     stops at the first one that runs out of memory or exceeds the budget.
+
+    Peak memory grows roughly linearly with batch size, so once two sizes have been
+    measured, the next one's peak is extrapolated and the search stops without trying it
+    if the estimate is over budget. That avoids deliberately running out of memory (and
+    the allocator warnings PyTorch prints when that happens). Catching OOM remains as a
+    fallback in case the estimate is too low.
     """
     best = None
+    measured: list[tuple[int, int]] = []  # (batch_size, peak_bytes) for sizes that fit
     for batch_size in sorted(candidates):
+        if len(measured) >= 2:
+            (n1, p1), (n2, p2) = measured[-2:]
+            estimate = p2 + (p2 - p1) / (n2 - n1) * (batch_size - n2)
+            if estimate > budget_bytes:
+                break
         try:
             peak = try_step(batch_size)
         except torch.OutOfMemoryError:
@@ -55,6 +67,7 @@ def largest_fitting(
         if peak > budget_bytes:
             break
         best = batch_size
+        measured.append((batch_size, peak))
     return best
 
 
