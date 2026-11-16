@@ -104,6 +104,7 @@ def test_cancel_at_prompt(monkeypatch, calls, tmp_path, capsys, exc):
 def test_workers_from_slurm_cpus(monkeypatch, tmp_path):
     monkeypatch.setenv("SLURM_CPUS_PER_TASK", "6")
     runs = dict(et.trace_runs(64, tmp_path))
+    assert runs["Main process"][-1] == "0"
     assert runs["Serial"][-1] == "1"
     for name in ["Threaded", "Threaded, compiled", "Threaded, compiled, AMP"]:
         args = runs[name]
@@ -152,7 +153,7 @@ def batch_sizes(train_cmds):
 def test_auto_batch_size_probes_once(train_runs, tmp_path, capsys):
     assert cli.main([CMD, "--output-dir", str(tmp_path)]) == 0
     assert train_runs.probes == 1
-    assert len(train_runs.train) == 4
+    assert len(train_runs.train) == 5
     assert batch_sizes(train_runs.train) == {"256"}
     assert "Batch size: 256 (auto-detected)" in capsys.readouterr().out
 

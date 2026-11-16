@@ -1,8 +1,11 @@
-"""Profile ResNet50 training on synthetic ImageNet-sized data and export a trace.
+"""Profile ResNet50 training on synthetic ImageNet-like JPEGs and export a trace.
 
 Author: Collin Wilson at 2026-11-13, https://github.com/cwilson51
 
 Run with ``python -m torch_trace_lab.train BATCH_SIZE [options]``.
+
+The images are real JPEG files on disk (see ``torch_trace_lab.synthetic_data``), so the
+DataLoader opens, reads, decodes and augments each one, as it would with ImageNet.
 """
 
 import argparse
@@ -14,15 +17,17 @@ from pathlib import Path
 import torch
 from torch.profiler import ProfilerActivity, profile, record_function, schedule
 from torchvision import transforms
-from torchvision.datasets import FakeData
+from torchvision.datasets import ImageFolder
 from torchvision.models import resnet50
 from tqdm import tqdm
+
+from torch_trace_lab.synthetic_data import default_data_dir, ensure_dataset, evict_from_page_cache
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         prog="python -m torch_trace_lab.train",
-        description="Profile ResNet50 training on synthetic ImageNet-sized data.",
+        description="Profile ResNet50 training on synthetic ImageNet-like JPEGs.",
     )
     parser.add_argument("batch_size", type=int, help="Batch size used for training.")
     parser.add_argument("--nWorkers", type=int, default=1,
@@ -30,6 +35,10 @@ def parse_args(argv=None):
     parser.add_argument("--nEpochs", type=int, default=1, help="Number of epochs to train.")
     parser.add_argument("--output_dir", type=str, default=".",
                         help="Directory to write the trace JSON to.")
+    parser.add_argument("--data_dir", type=Path, default=None,
+                        help="Directory for the synthetic JPEG dataset; created if missing "
+                             "(default: $SLURM_TMPDIR/synthetic-imagenet in a Slurm job, "
+                             "otherwise ~/.cache/torch-trace-lab/synthetic-imagenet).")
     parser.add_argument("--compile", action="store_true",
                         help="Compile the model and optimizer.")
     parser.add_argument("--amp", action="store_true",
@@ -63,19 +72,24 @@ def main(argv=None):
     std = (0.229, 0.224, 0.225)
     transform = transforms.Compose(
         [
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(mean, std),
         ]
     )
 
-    train_ds = FakeData(
-        size=10_000,
-        image_size=(3, 224, 224),
-        num_classes=1000,
-        transform=transform,
+    # Enough images that the loop never runs out before profiling finishes.
+    data_dir = ensure_dataset(
+        args.data_dir or default_data_dir(),
+        n_images=args.batch_size * iterations,
+        workers=int(os.environ.get("SLURM_CPUS_PER_TASK", 0)) or None,
     )
+    # Start every run with cold reads, as in a first epoch, so runs are comparable.
+    if not evict_from_page_cache(data_dir):
+        warnings.warn("Cannot evict the dataset from the page cache on this OS; "
+                      "file reads may be served from memory.", stacklevel=1)
+    train_ds = ImageFolder(data_dir, transform=transform)
 
     train_dataloader = torch.utils.data.DataLoader(
         train_ds,

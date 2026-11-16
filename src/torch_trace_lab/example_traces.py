@@ -38,6 +38,7 @@ def trace_runs(batch_size: int, output_dir: Path) -> list[tuple[str, list[str]]]
     n = str(threaded_workers())
     base = [str(batch_size), "--output_dir", str(output_dir), *PROFILE_ARGS]
     return [
+        ("Main process", [*base, "--nWorkers", "0"]),  # PyTorch default: no worker processes
         ("Serial", [*base, "--nWorkers", "1"]),
         ("Threaded", [*base, "--nWorkers", n]),
         ("Threaded, compiled", [*base, "--nWorkers", n, "--compile"]),
