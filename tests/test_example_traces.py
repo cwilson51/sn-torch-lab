@@ -9,13 +9,6 @@ from torch_trace_lab import cli, example_traces as et
 CMD = "generate-example-traces"
 
 
-@pytest.fixture(autouse=True)
-def clean_env(monkeypatch):
-    for var in ["CC_CLUSTER", "SLURM_JOB_ID", "SLURM_ACCOUNT", "SBATCH_ACCOUNT",
-                "SLURM_CPUS_PER_TASK"]:
-        monkeypatch.delenv(var, raising=False)
-
-
 @pytest.fixture
 def calls(monkeypatch):
     record = SimpleNamespace(run_traces=0, subprocess=[])

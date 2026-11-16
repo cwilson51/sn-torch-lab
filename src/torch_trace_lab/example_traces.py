@@ -14,24 +14,10 @@ import sys
 from importlib.resources import files
 from pathlib import Path
 
+from torch_trace_lab.cluster import in_slurm_job, on_alliance_cluster, threaded_workers
+
 TEMPLATE = "templates/generate_example_traces.sh"
 PROFILE_ARGS = ["--skip_first", "10", "--warmup", "10", "--active", "10"]
-
-
-def on_alliance_cluster() -> bool:
-    """Every Alliance (Compute Canada) cluster sets CC_CLUSTER."""
-    return bool(os.environ.get("CC_CLUSTER"))
-
-
-def in_slurm_job() -> bool:
-    return bool(os.environ.get("SLURM_JOB_ID"))
-
-
-def threaded_workers() -> int:
-    cpus = os.environ.get("SLURM_CPUS_PER_TASK")
-    if cpus:
-        return int(cpus)
-    return min(os.cpu_count() or 1, 4)
 
 
 # Each config writes to its own run directory, the layout `torch-lab analyze-traces` expects.
