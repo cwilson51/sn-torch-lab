@@ -22,6 +22,7 @@ PROFILE_ARGS = ["--skip_first", "10", "--warmup", "10", "--active", "10"]
 
 # Each config writes to its own run directory, the layout `torch-lab analyze-traces` expects.
 RUN_SUBDIRS = {
+    "Main process": "main-process",
     "Serial": "serial",
     "Threaded": "threaded",
     "Threaded, compiled": "threaded-compiled",
@@ -32,6 +33,7 @@ RUN_SUBDIRS = {
 def trace_runs(batch_size: int, output_dir: Path) -> list[tuple[str, list[str]]]:
     n = str(threaded_workers())
     configs = [
+        ("Main process", ["--nWorkers", "0"]),  # PyTorch default: no worker processes
         ("Serial", ["--nWorkers", "1"]),
         ("Threaded", ["--nWorkers", n]),
         ("Threaded, compiled", ["--nWorkers", n, "--compile"]),
