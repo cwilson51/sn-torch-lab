@@ -16,19 +16,25 @@ GENERIC_VALUES = {"none", "cpu", "gpu", "cores", "quiet", "block", "cyclic", "no
                   "true", "false", "yes", "no", "default"}
 
 
-def _slurm_values(environ) -> set[str]:
-    values = set()
-    for name, value in environ.items():
+def _slurm_values(environ) -> dict[str, str]:
+    """SLURM_* variables worth checking, as {value: variable name}.
+
+    Skips short and generic values, and the cluster name (e.g. SLURM_CLUSTER_NAME=nibi),
+    which may appear in the bundle (spec §5.2).
+    """
+    cluster = environ.get("CC_CLUSTER", "").strip().lower()
+    values = {}
+    for name, value in sorted(environ.items()):
         if not name.startswith("SLURM_"):
             continue
         value = value.strip()
-        if value.lower() in GENERIC_VALUES:
+        if value.lower() in GENERIC_VALUES or (cluster and value.lower() == cluster):
             continue
         if value.isdigit() and len(value) < 6:
             continue
         if len(value) < 4:
             continue
-        values.add(value)
+        values.setdefault(value, name)
     return values
 
 
@@ -66,10 +72,9 @@ def find_leaks(text: str, *, key: str | None = None, environ=None) -> list[str]:
         if word(host).search(text):
             found.append("the local hostname")
             break
-    for value in sorted(_slurm_values(environ)):
+    for value, name in _slurm_values(environ).items():
         if word(value).search(text):
-            found.append("a SLURM_* environment value")
-            break
+            found.append(f"the value of ${name}")
     if m := ACCOUNT.search(text):
         found.append(f"an allocation account name ({m.group(1)}-...)")
     return found

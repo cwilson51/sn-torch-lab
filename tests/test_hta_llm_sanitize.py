@@ -23,6 +23,17 @@ def test_finds_each_kind(monkeypatch):
     assert leaks("key sk-abc123", key="sk-abc123")
 
 
+def test_slurm_finding_names_the_variable():
+    found = leaks("job 4471234 finished")
+    assert found == ["the value of $SLURM_JOB_ID"]
+    assert "4471234" not in found[0]
+
+
+def test_cluster_name_is_allowed():
+    env = {**ENV, "CC_CLUSTER": "nibi", "SLURM_CLUSTER_NAME": "nibi"}
+    assert sanitize.find_leaks("- Cluster: nibi", environ=env) == []
+
+
 def test_username_needs_word_boundary():
     assert leaks("jdoexyz") == []
 

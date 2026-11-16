@@ -103,6 +103,19 @@ def test_real_hta_on_fixture(tmp_path):
     assert m.gpu_idle_pct is not None and m.host_wait_pct_of_idle == 100.0
 
 
+@pytest.mark.parametrize("gpu_annotations", [False, True])
+def test_gpu_step_annotations_are_not_kernels_or_steps(tmp_path, gpu_annotations):
+    """Real CUDA traces mirror ProfilerStep#N on the GPU; HTA would count them as kernels."""
+    write_trace(tmp_path / "t.json", steps=10, gpu_annotations=gpu_annotations,
+                kernels=[("volta_sgemm_128x64_nn", 400), ("elementwise", 100)])
+    a = analyses.run_all(tmp_path)
+    m = normalize.normalize_run("a", a)
+    assert a.steps in (8, 9)  # complete steps only; never doubled
+    assert [k.short for k in m.kernels] == ["volta_sgemm_128x64_nn", "elementwise"]
+    assert m.kernel_ms_per_step == 0.5           # 400 + 100 µs per step
+    assert m.kernels[0].calls_per_step == 1.0
+
+
 def test_failed_analysis_is_recorded(tmp_path, monkeypatch):
     write_trace(tmp_path / "t.json")
     monkeypatch.setattr(analyses, "idle", lambda ta: 1 / 0)

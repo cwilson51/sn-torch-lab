@@ -30,6 +30,7 @@ def make_trace(
     memcpy_us: int = 0,
     gpu: bool = True,
     profiler_steps: bool = True,
+    gpu_annotations: bool = True,
     rank: int | None = None,
     world_size: int | None = None,
     torch_lab: dict | None = None,
@@ -37,7 +38,10 @@ def make_trace(
     python_functions: list[str] = (),
     device_properties=DEVICE_PROPERTIES,
 ) -> dict:
-    events = []
+    # Start with an unrelated CPU op, as real traces do: HTA links GPU events to their launch
+    # by row index and treats index 0 as "no link".
+    events = [{"ph": "X", "cat": "cpu_op", "name": "aten::empty", "pid": 100, "tid": 100,
+               "ts": 990, "dur": 1, "args": {}}]
     t = 1000
     corr = 1
     pid, tid = 100, 100
@@ -72,6 +76,14 @@ def make_trace(
             events.append({"ph": "X", "cat": "user_annotation", "name": f"ProfilerStep#{step}",
                            "pid": pid, "tid": tid, "ts": step_start, "dur": end - step_start,
                            "args": {}})
+            if gpu and gpu_annotations:
+                # Real CUDA traces mirror each step annotation on the GPU timeline,
+                # spanning the step's kernels.
+                first = step_start + launch_us
+                events.append({"ph": "X", "cat": "gpu_user_annotation",
+                               "name": f"ProfilerStep#{step}", "pid": 0, "tid": 7,
+                               "ts": first, "dur": gpu_t - first,
+                               "args": {"device": 0, "stream": 7, "External id": corr}})
         t = end
     for i, name in enumerate(python_functions):
         events.append({"ph": "X", "cat": "python_function", "name": name, "pid": pid, "tid": tid,

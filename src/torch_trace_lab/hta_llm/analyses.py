@@ -48,7 +48,23 @@ def load(trace_dir: Path):
 
     hta_config_logger.setLevel(logging.ERROR)
     with quiet():
-        return TraceAnalysis(trace_dir=str(trace_dir))
+        ta = TraceAnalysis(trace_dir=str(trace_dir))
+    drop_gpu_annotations(ta)
+    return ta
+
+
+def drop_gpu_annotations(ta) -> None:
+    """Remove ``gpu_user_annotation`` events (ProfilerStep#N, record_function ranges).
+
+    CUDA traces mirror each annotation on the GPU timeline with a stream, so HTA would
+    count them as kernels: they would appear in the kernel table, inflate GPU kernel time,
+    and double the ProfilerStep count.
+    """
+    anno_id = ta.t.symbol_table.get_sym_id_map().get("gpu_user_annotation")
+    if anno_id is None:
+        return
+    for rank, df in ta.t.traces.items():
+        ta.t.traces[rank] = df[df["cat"] != anno_id]
 
 
 def temporal(ta) -> pd.DataFrame:
@@ -91,16 +107,29 @@ def launch(ta) -> pd.DataFrame:
                               "launch_delay": "launch_delay_us"}).reset_index(drop=True)
 
 
-def profiler_steps(ta) -> tuple[int | None, float | None]:
+def trim_to_complete_steps(ta) -> tuple[int | None, float | None]:
+    """Keep only events from complete ProfilerSteps; return (steps, mean step time in µs).
+
+    The last recorded step is dropped, since it may be cut off at export. Every analysis then
+    sees exactly the same steps, so totals divided by ``steps`` are true per-step means.
+    HTA does its own trimming, but its cutoff shifts with GPU-side annotations, so it is not
+    relied on. Without ProfilerStep annotations nothing is trimmed and (None, None) is returned.
+    """
     trace = ta.t
-    rank = min(trace.traces)
-    df = trace.get_trace(rank)
     symbols = trace.symbol_table.get_sym_table()
     step_ids = [i for i, s in enumerate(symbols) if str(s).startswith("ProfilerStep#")]
-    steps = df[df["name"].isin(step_ids)]
-    if steps.empty:
-        return None, None
-    return len(steps), float(steps["dur"].mean())
+    result = (None, None)
+    for rank, df in trace.traces.items():
+        steps = df[df["name"].isin(step_ids) & (df["stream"] < 0)]  # CPU-side annotations
+        iterations = sorted(i for i in steps["iteration"].unique() if i >= 0)
+        if not iterations:
+            continue
+        kept = iterations[:-1] if len(iterations) > 1 else iterations
+        trace.traces[rank] = df[df["iteration"].isin(kept)]
+        if rank == min(trace.traces):
+            kept_steps = steps[steps["iteration"].isin(kept)]
+            result = (len(kept), float(kept_steps["dur"].mean()))
+    return result
 
 
 def run_all(trace_dir: Path) -> RunAnalysis:
@@ -112,9 +141,9 @@ def run_all(trace_dir: Path) -> RunAnalysis:
         return result
     with quiet():
         try:
-            result.steps, result.step_time_us = profiler_steps(ta)
-        except Exception:  # noqa: BLE001
-            pass
+            result.steps, result.step_time_us = trim_to_complete_steps(ta)
+        except Exception as e:  # noqa: BLE001
+            result.unavailable["steps"] = f"could not split the trace into steps: {e}"
         for name, fn in [("temporal", temporal), ("idle", idle), ("kernels", kernels),
                          ("launch", launch)]:
             try:
