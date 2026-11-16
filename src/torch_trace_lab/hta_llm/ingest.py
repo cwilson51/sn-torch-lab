@@ -10,6 +10,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from torch_trace_lab.hta_llm.infer import Evidence, collect_evidence
 from torch_trace_lab.hta_llm.sanitize import unsafe_label
 
 LAYOUT_HELP = """\
@@ -30,6 +31,7 @@ class TraceInfo:
     metadata: dict          # top-level keys except traceEvents (not allowlisted yet)
     has_gpu_kernels: bool
     has_profiler_steps: bool
+    evidence: Evidence | None = None  # compact summary for config inference; events aren't kept
 
     @property
     def distributed(self) -> dict | None:
@@ -81,10 +83,8 @@ def inspect_trace(path: Path) -> TraceInfo | None:
             has_kernels = True
         elif cat == "user_annotation" and str(e.get("name", "")).startswith("ProfilerStep#"):
             has_steps = True
-        if has_kernels and has_steps:
-            break
     metadata = {k: v for k, v in data.items() if k != "traceEvents"}
-    return TraceInfo(path, metadata, has_kernels, has_steps)
+    return TraceInfo(path, metadata, has_kernels, has_steps, collect_evidence(events))
 
 
 def _trace_candidates(directory: Path) -> list[Path]:

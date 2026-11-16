@@ -17,6 +17,13 @@ MEMCPY_HIGH_PCT = 10.0            # H2D + D2H > this % of GPU kernel time
 NO_AMP_MIN_COMPUTE_CAPABILITY = 7.0
 NO_AMP_FP32_SHARE_PCT = 50.0      # fp32/tf32 GEMM+conv time > this % of GEMM+conv time
 
+# Config inference from trace contents (hta_llm/infer.py)
+INFER_HIGH_SHARE_PCT = 80.0       # dominant precision >= this % of GEMM/conv time -> high confidence
+INFER_MIN_SHARE_PCT = 50.0        # >= this -> medium; below -> low. Also the NHWC-kernel share
+                                  # for inferring channels_last
+INFER_TRANSPOSE_PCT = 5.0         # NCHW<->NHWC transposes >= this % of GEMM/conv time ->
+                                  # tensors are NCHW and cuDNN converts them
+
 # Prompt size. Brine chat models allow 131,072 tokens in + out.
 CONTEXT_TOKENS = 131_072
 MAX_PROMPT_TOKENS = 24_000

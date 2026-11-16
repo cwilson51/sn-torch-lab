@@ -37,7 +37,11 @@ def make_trace(
     extra_top: dict | None = None,
     python_functions: list[str] = (),
     device_properties=DEVICE_PROPERTIES,
+    extra_events: list[dict] = (),
 ) -> dict:
+    """``extra_events`` are partial events (at least ``cat`` and ``name``, optionally ``args``);
+    they are placed on the CPU thread in the first step, e.g. DataLoader annotations,
+    ``Torch-Compiled Region`` ops, ``cpu_op`` events with ``Input Dims``, ``cudaGraphLaunch``."""
     # Start with an unrelated CPU op, as real traces do: HTA links GPU events to their launch
     # by row index and treats index 0 as "no link".
     events = [{"ph": "X", "cat": "cpu_op", "name": "aten::empty", "pid": 100, "tid": 100,
@@ -85,6 +89,9 @@ def make_trace(
                                "ts": first, "dur": gpu_t - first,
                                "args": {"device": 0, "stream": 7, "External id": corr}})
         t = end
+    for i, partial in enumerate(extra_events):
+        events.append({"ph": "X", "pid": pid, "tid": tid, "ts": 1001 + i, "dur": 1, "args": {},
+                       **partial})
     for i, name in enumerate(python_functions):
         events.append({"ph": "X", "cat": "python_function", "name": name, "pid": pid, "tid": tid,
                        "ts": 1000 + i, "dur": 1, "args": {}})
