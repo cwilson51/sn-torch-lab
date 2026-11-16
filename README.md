@@ -41,15 +41,24 @@ Generate the example traces used in the demo with
 torch-lab generate-example-traces
 ```
 
-This produces the fixed ResNet50 examples shown in the presentation; it is not a tool for profiling your own code. It profiles ResNet50 training in four configurations (serial, threaded, threaded + `torch.compile`, threaded + `torch.compile` + AMP) and writes the trace JSON files to `./traces` (change with `--output-dir`). What happens depends on where you run it:
+This produces the fixed ResNet50 examples shown in the presentation; it is not a tool for profiling your own code. It profiles ResNet50 training in five configurations (main process, i.e. the DataLoader default `num_workers=0`; serial, one worker process; threaded, threaded + `torch.compile`, threaded + `torch.compile` + AMP) and writes the trace JSON files to `./traces` (change with `--output-dir`). What happens depends on where you run it:
 
 - **Your own machine:** the runs execute locally. Without a CUDA GPU they fall back to CPU-only profiling.
 - **An Alliance cluster, inside a job** (e.g. after `salloc --gpus=1 ...`): the runs execute directly on the allocated node.
 - **An Alliance cluster login node:** you are asked whether to submit a batch job and which account to use (e.g. `def-someuser`). The job reuses your current virtual environment, and the job script and Slurm log are saved next to the traces.
 
+#### Training data
+
+The runs train on a synthetic ImageNet-like dataset: real JPEG files on disk (about 500 px on the long side and 100–150 KB each on average, with a few larger images), loaded through `ImageFolder` with the standard `RandomResizedCrop` and horizontal-flip augmentation. Each sample is opened, read, decoded and augmented, so the DataLoader cost in the traces looks like real training. With `torchvision.datasets.FakeData`, images are made in memory and no file is ever read.
+
+- The dataset is created on first use, with enough images for the profiled steps (batch size × 35). Inside a Slurm job it goes in node-local `$SLURM_TMPDIR/synthetic-imagenet`. Elsewhere it goes in `~/.cache/torch-trace-lab/synthetic-imagenet`, and later runs reuse it.
+- On Linux, each run first evicts the files from the page cache, so every configuration starts with cold reads like a first epoch. On macOS reads may come from memory.
+
+To create a dataset by hand, run `python -m torch_trace_lab.synthetic_data ROOT N_IMAGES`. Pass `--data_dir` to `python -m torch_trace_lab.train` to use it.
+
 #### Batch size
 
-By default (`--batch-size auto`) the batch size is chosen on the machine that runs the training, and all four configurations use the same size so their traces are comparable:
+By default (`--batch-size auto`) the batch size is chosen on the machine that runs the training, and all five configurations use the same size so their traces are comparable:
 
 - **With a CUDA GPU:** the largest power of 2 (from 8 up to 512) whose peak memory for one fp32 ResNet50 training step stays within 90% of free GPU memory. Expect about 64 on an `h100_1g.10gb` MIG slice and 512 on a full H100.
 - **CPU only:** a fixed 32, since run time rather than memory is the limit.
