@@ -41,7 +41,15 @@ Generate the example traces used in the demo with
 torch-lab generate-example-traces
 ```
 
-This produces the fixed ResNet50 examples shown in the presentation; it is not a tool for profiling your own code. It profiles ResNet50 training in four configurations (serial, threaded, threaded + `torch.compile`, threaded + `torch.compile` + AMP) and writes the trace JSON files to `./traces` (change with `--output-dir`). What happens depends on where you run it:
+This produces the fixed ResNet50 examples shown in the presentation; it is not a tool for profiling your own code. It profiles ResNet50 training in four configurations (serial, threaded, threaded + `torch.compile`, threaded + `torch.compile` + AMP) and writes each configuration's trace to its own run directory under `./traces` (change with `--output-dir`):
+
+```
+traces/
+  serial/                  threaded/
+  threaded-compiled/       threaded-compiled-amp/
+```
+
+Each trace also records its run configuration (batch size, DataLoader workers, `torch.compile`, precision) in a top-level `torch_lab` object, which `torch-lab analyze-traces` reads. What happens depends on where you run it:
 
 - **Your own machine:** the runs execute locally. Without a CUDA GPU they fall back to CPU-only profiling.
 - **An Alliance cluster, inside a job** (e.g. after `salloc --gpus=1 ...`): the runs execute directly on the allocated node.
@@ -71,3 +79,95 @@ torch-lab generate-example-traces --account def-someuser --yes      # submit wit
 torch-lab generate-example-traces --account def-someuser --dry-run  # print the job script only
 torch-lab generate-example-traces --time 0-01:00:00 --gpus h100:1   # change the resource request
 ```
+
+### Analyzing traces with HTA and an LLM
+
+```
+torch-lab analyze-traces ./traces
+```
+
+`analyze-traces` runs [Holistic Trace Analysis](https://github.com/facebookresearch/HolisticTraceAnalysis) on PyTorch Profiler traces, computes rule-based performance flags, and asks an LLM on [SHARCNET Brine](https://brine.sharcnet.ca) for a ranked, actionable report. With one run it answers "how can I make this faster?"; with several runs it answers "why do they differ, and how does the bottleneck mix shift?". Only single-GPU runs are supported for now.
+
+**Trace layout.** File names don't matter; the structure comes from directories:
+
+```
+# one run                                # several runs to compare
+torch-lab analyze-traces my-run/         torch-lab analyze-traces experiments/
+my-run/                                  experiments/
+  trace.json                               baseline/trace.json
+                                           bs128-amp/trace.json
+```
+
+You can also pass a single trace file, or two or more run directories (`torch-lab analyze-traces runA/ runB/`). Each run directory holds one run. The output of `generate-example-traces` already follows this layout, so `torch-lab analyze-traces ./traces` compares its four configurations. The traces must be recorded on a CUDA GPU: traces from a CPU-only machine (including any Mac) have no GPU kernels to analyze.
+
+**Outputs** (in `./hta-report`, change with `--output-dir`):
+
+- `report.md`: the LLM report, or a flags-only report with `--no-llm` or when Brine can't be used;
+- `bundle.md` / `bundle.json`: the aggregated tables, flags, and run context sent to the LLM;
+- `prompt.md`: exactly what is (or would be) sent to Brine;
+- `run.log`.
+
+**Options:**
+
+| Option | Meaning |
+|---|---|
+| `--run-note [LABEL=]TEXT` | Free-text context for a run, e.g. `--run-note baseline="bs 64, 8 workers"`. Repeatable. For a single run, the label can be left out. |
+| `--baseline LABEL` | Baseline run for comparisons (default: the first run). |
+| `--top-n N` | Kernels per table (default: 15). |
+| `--model NAME` | Brine model (default: `$TORCH_LAB_BRINE_MODEL`, `$BRINE_MODEL`, or `DeepSeek-V4-Flash-0731`). |
+| `--no-llm` | Write the bundle, prompt, and a flags-only report without calling Brine. |
+
+**Brine API key.** Each user needs their own Brine key. Set `BRINE_API_KEY`, or store the key in `~/.config/torch-lab/brine_key` with `chmod 600`. The key is never written to any output. If the key is missing, Brine can't be reached, or the call fails, the bundle, prompt and a flags-only report are still written and the command exits with status 1.
+
+**What is sent to Brine.** Only aggregated tables (per-step times, top kernels, idle breakdown, flags) and allowlisted run facts (GPU model, precision, batch size, ...). Raw traces, file paths, usernames, hostnames, job IDs and Slurm data are never sent. Before every call a leak check scans the prompt for your username, home directory, cluster paths, hostname, Slurm values and account names, and blocks the call if it finds any. **`--run-note` text and run directory names are sent as written, so keep sensitive information out of them.** Check `prompt.md` to see exactly what was sent.
+
+**Where to run it.** On your own machine, or inside a job on an Alliance cluster. A GPU is not needed. On a login node the command refuses to run, because loading the traces needs several GB of memory. Start an interactive job instead:
+
+```
+salloc --time=0:30:0 --cpus-per-task=4 --mem=16G --account=def-someuser
+torch-lab analyze-traces ./traces
+```
+
+Open OnDemand desktop and JupyterLab sessions work too. If the compute nodes can't reach `brine.sharcnet.ca`, run with `--no-llm` there, or copy the traces to a machine that can reach Brine.
+
+#### Profiling your own code
+
+To produce traces that `analyze-traces` can compare, profile a fixed number of steps in each run and give each run its own directory:
+
+```python
+import json
+from pathlib import Path
+
+import torch
+from torch.profiler import ProfilerActivity, profile, schedule
+
+run_dir = Path("experiments/baseline")  # one directory per run; file names don't matter
+run_dir.mkdir(parents=True, exist_ok=True)
+
+with profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    schedule=schedule(skip_first=10, wait=0, warmup=10, active=10, repeat=1),
+    record_shapes=True,  # larger traces and some overhead, but more detail
+) as prof:
+    for step, (inputs, labels) in enumerate(loader):
+        train_step(inputs, labels)
+        prof.step()  # once per training iteration
+        if step >= 35:
+            break
+
+trace = run_dir / "trace.json"
+prof.export_chrome_trace(str(trace))
+
+# Optional: record the run config so the report can explain differences between runs.
+data = json.loads(trace.read_text())
+data["torch_lab"] = {
+    "model": "my model",
+    "batch_size_per_gpu": 64,
+    "dataloader_workers": 8,
+    "torch_compile": False,
+    "precision": "bf16-amp",  # fp32 | tf32 | fp16-amp | bf16-amp
+}
+trace.write_text(json.dumps(data))
+```
+
+For distributed runs, every rank writes its own trace file into the same run directory. Multi-GPU analysis is planned but not supported yet.
