@@ -135,11 +135,6 @@ def assemble(c: Collected, top_n: int, drop: tuple[str, ...] = (),
     return b, bundle.render_markdown(b)
 
 
-def analyze(opts: Options, log: Log) -> tuple[dict, str]:
-    """Stages 1-4 at the requested size. Raises IngestError / ValueError."""
-    return assemble(collect(opts, log), opts.top_n)
-
-
 def budget_plan(top_n: int) -> list[tuple[int, tuple[str, ...]]]:
     """Sizes to try, in order: as requested, smaller top-N, then fewer optional sections."""
     plan = [(top_n, ())]

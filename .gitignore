@@ -23,3 +23,6 @@ docs/adr/
 .scratch/
 brine-examples
 specs
+
+# scripts/eval_models.py output
+/eval/
