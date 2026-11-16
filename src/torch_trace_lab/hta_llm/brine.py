@@ -4,6 +4,7 @@ The API key is never logged, printed, or written to any output, including error 
 """
 
 import os
+import re
 import stat
 import time
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ class Completion:
     usage: dict
     latency_s: float
     model: str
+    finish_reason: str | None = None
 
 
 URL_HELP = ("Set BRINE_BASE_URL to the Brine API endpoint, e.g. "
@@ -78,8 +80,18 @@ def load_key(environ=None, key_file: str | None = None) -> str:
     return key
 
 
+# Names of models on Brine that are not chat models (embeddings, speech, LiteLLM aliases).
+NOT_CHAT = re.compile(r"embed|whisper|rerank|tts|transcri|proxy", re.I)
+
+
+def is_chat_model(name: str) -> bool:
+    return not NOT_CHAT.search(name)
+
+
 class Client:
-    def __init__(self, key: str, url: str | None = None, session=None, sleep=time.sleep):
+    def __init__(self, key: str, url: str | None = None, session=None, sleep=time.sleep,
+                 timeout: float | None = None):
+        self.timeout = timeout or settings.REQUEST_TIMEOUT_S
         self.url = url or base_url()
         check_egress(self.url)
         self._key = key
@@ -99,7 +111,7 @@ class Client:
                 self.sleep(settings.RETRY_BACKOFF_S * 2 ** (attempt - 1))
             try:
                 resp = self.session.request(method, f"{self.url}{path}", headers=self._headers(),
-                                            timeout=settings.REQUEST_TIMEOUT_S, **kwargs)
+                                            timeout=self.timeout, **kwargs)
             except requests.Timeout:
                 last = "the request timed out"
                 continue
@@ -127,17 +139,18 @@ class Client:
     def check_model(self, model: str) -> None:
         available = self.models()
         if model not in available:
-            chat = [m for m in available if "embed" not in m.lower()]
+            chat = [m for m in available if is_chat_model(m)]
             raise BrineError(f"Model {model!r} is not available on Brine. Available chat models: "
                              f"{', '.join(chat) or '(none listed)'}. Choose one with --model.")
 
-    def chat(self, model: str, system: str, user: str) -> Completion:
+    def chat(self, model: str, system: str, user: str, *,
+             max_tokens: int | None = None) -> Completion:
         start = time.monotonic()
         data = self._request("POST", "/chat/completions", json={
             "model": model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "temperature": settings.TEMPERATURE,
-            "max_tokens": settings.MAX_TOKENS,
+            "max_tokens": max_tokens or settings.MAX_TOKENS,
         })
         latency = time.monotonic() - start
         try:
@@ -145,9 +158,15 @@ class Client:
             content = choice["message"]["content"] or ""
         except (KeyError, IndexError, TypeError):
             raise BrineError("Brine returned an unexpected response (no choices).") from None
+        usage = data.get("usage") or {}
         if choice.get("finish_reason") == "length":
-            raise BrineError("The model ran out of output tokens before finishing the report. "
-                             "Try a smaller --top-n.")
+            used = usage.get("completion_tokens")
+            details = usage.get("completion_tokens_details") or {}
+            reasoning = details.get("reasoning_tokens") if isinstance(details, dict) else None
+            spent = (f" ({used} output tokens" + (f", {reasoning} of them reasoning" if reasoning
+                                                   else "") + ")") if used else ""
+            raise BrineError("The model ran out of output tokens before finishing the report"
+                             f"{spent}. Try a smaller --top-n.")
         if not content.strip():
             raise BrineError("The model returned an empty report. Try again, or a smaller --top-n.")
-        return Completion(content, data.get("usage") or {}, latency, model)
+        return Completion(content, usage, latency, model, choice.get("finish_reason"))

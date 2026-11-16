@@ -145,3 +145,28 @@ def test_model_precedence():
     assert brine.model_name(None, env) == "t"
     assert brine.model_name(None, {"BRINE_MODEL": "b"}) == "b"
     assert brine.model_name(None, {}) == "DeepSeek-V4-Flash-0731"
+
+
+def test_max_tokens_and_timeout_can_be_raised():
+    c = brine.Client(KEY, url="https://brine.sharcnet.ca/v1", session=FakeSession(completion()),
+                     sleep=lambda s: None, timeout=900)
+    result = c.chat("m", "s", "u", max_tokens=16000)
+    kw = c.session.calls[0][2]
+    assert kw["json"]["max_tokens"] == 16000 and kw["timeout"] == 900
+    assert result.finish_reason == "stop"
+
+
+def test_length_error_reports_reasoning_tokens():
+    resp = Resp(data={"choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+                      "usage": {"completion_tokens": 6144,
+                                "completion_tokens_details": {"reasoning_tokens": 6000}}})
+    with pytest.raises(BrineError, match="6144 output tokens, 6000 of them reasoning"):
+        client(resp).chat("m", "s", "u")
+
+
+@pytest.mark.parametrize("name, chat", [
+    ("DeepSeek-V4-Flash-0731", True), ("Qwen3.8-27B", True), ("North-Mini-Code-1.0", True),
+    ("qwen3-embed", False), ("whisper-large-v3-turbo", False), ("all-proxy-models", False),
+])
+def test_is_chat_model(name, chat):
+    assert brine.is_chat_model(name) is chat

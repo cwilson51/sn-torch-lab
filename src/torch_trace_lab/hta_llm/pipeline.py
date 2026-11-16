@@ -54,6 +54,7 @@ def build_prompt(b: dict, bundle_md: str) -> tuple[str, str]:
     user = user.replace(f"<!-- {keep} -->\n", "").replace(f"<!-- /{keep} -->\n", "")
     user = (user.replace("{{N_RUNS}}", str(len(b["runs"])))
                 .replace("{{BASELINE}}", str(b["baseline"]))
+                .replace("{{META_KEYS}}", meta.key_list())
                 .replace("{{REMEDIATION}}", report.prompt_file("remediation.md").strip())
                 .replace("{{BUNDLE}}", bundle_md))
     return system, user

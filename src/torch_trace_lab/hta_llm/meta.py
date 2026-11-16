@@ -155,6 +155,12 @@ def load_meta(path: Path, labels: list[str]) -> tuple[dict[str, dict], list[str]
     return per_run, warnings
 
 
+def key_list() -> str:
+    """The accepted keys, for the prompt: model, task, ..., ddp.bucket_cap_mb, ..."""
+    keys = [*SCHEMA, *(f"{table}.{key}" for table, keys in NESTED.items() for key in keys)]
+    return ", ".join(f"`{k}`" for k in keys)
+
+
 def as_config(values: dict) -> tuple[dict, str | None]:
     """Split one run's --meta values into (config entries with source=user, notes)."""
     values = dict(values)

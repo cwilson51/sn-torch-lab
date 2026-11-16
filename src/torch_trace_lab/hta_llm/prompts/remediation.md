@@ -32,6 +32,7 @@ A large share of GPU time is spent copying data between host and device.
 
 ## NO_AMP_SUSPECTED
 Matrix multiplies and convolutions run in fp32 (or TF32) on a GPU with tensor cores for fp16/bf16. TF32 is faster than fp32, but fp16/bf16 is typically faster still and halves activation memory.
+Note: PyTorch runs cuDNN convolutions in TF32 by default (`torch.backends.cudnn.allow_tf32 = True`), even when matmuls stay fp32 (`torch.set_float32_matmul_precision("highest")`, the default). So a model written in plain fp32 usually shows TF32 convolution kernels; that is expected, not a misconfiguration.
 - Use automatic mixed precision: `with torch.autocast("cuda", dtype=torch.bfloat16):` around the forward pass and loss (bf16 needs no GradScaler; supported on compute capability ≥ 8.0).
 - On GPUs without bf16 (compute capability 7.x), use `dtype=torch.float16` with `torch.amp.GradScaler("cuda")`.
 - If staying in fp32, at least enable TF32: `torch.set_float32_matmul_precision("high")`.

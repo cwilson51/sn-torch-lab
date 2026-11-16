@@ -382,3 +382,12 @@ def test_within_budget_bundle_is_unchanged(two_runs, tmp_path):
     assert b["budget"]["dropped_sections"] == [] and b["budget"]["top_n_used"] == 15
     assert b["budget"]["estimated_tokens"] < b["budget"]["max_prompt_tokens"]
     assert "To fit the prompt budget" not in (out / "bundle.md").read_text()
+
+
+def test_prompt_lists_meta_keys_and_has_no_placeholders(two_runs, tmp_path):
+    out = tmp_path / "out"
+    assert run(two_runs, "--no-llm", "--output-dir", out) == 0
+    prompt = (out / "prompt.md").read_text()
+    assert "{{" not in prompt
+    assert "`batch_size_per_gpu`" in prompt and "`deepspeed.zero_stage`" in prompt
+    assert "allow_tf32" in prompt  # remediation note on cuDNN's default TF32 convolutions

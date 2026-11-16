@@ -15,6 +15,10 @@ Fewer issues is better. Pick the default model in hta_llm/settings.py by hand, a
 reading a few of the reports as well: the checks catch hallucination, not bad advice.
 
     uv run python scripts/eval_models.py hta-report/ other-report/ --models A,B --out eval
+
+By default every chat model on Brine is tried (embedding, speech and proxy-alias models are
+skipped). Reasoning models spend output tokens on thinking, and large models can be slow:
+raise --max-tokens and --timeout so they get a fair run.
 """
 
 import argparse
@@ -25,7 +29,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from torch_trace_lab.hta_llm import brine, sanitize
+from torch_trace_lab.hta_llm import brine, sanitize, settings
 from torch_trace_lab.hta_llm.heuristics import MEANINGS
 
 NUMBER_WITH_UNIT = re.compile(
@@ -107,6 +111,8 @@ class Score:
     fired_not_mentioned: list[str] = field(default_factory=list)
     latency_s: float | None = None
     error: str | None = None
+    finish_reason: str | None = None
+    usage: dict = field(default_factory=dict)
 
     @property
     def issues(self) -> int:
@@ -153,6 +159,9 @@ def details(scores: list[Score]) -> str:
         out.append(f"### {s.model} on {s.bundle}")
         if s.error:
             out.append(f"- error: {s.error}")
+        else:
+            out.append(f"- finish_reason: {s.finish_reason}; usage: {json.dumps(s.usage)}; "
+                       f"latency: {s.latency_s:.0f} s")
         for label, items in [("ungrounded numbers", s.ungrounded),
                              ("invented names", s.invented),
                              ("flags cited, not fired", s.cited_not_fired),
@@ -177,7 +186,15 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("reports", nargs="+", type=Path,
                         help="analyze-traces output directories (with prompt.md, bundle.json)")
-    parser.add_argument("--models", help="Comma-separated models (default: all on Brine).")
+    parser.add_argument("--models", help="Comma-separated models (default: every chat model "
+                                         "on Brine).")
+    parser.add_argument("--max-tokens", type=int, default=settings.MAX_TOKENS,
+                        help=f"Output token limit per report (default: {settings.MAX_TOKENS}, "
+                             "as analyze-traces uses). Raise it for reasoning models.")
+    parser.add_argument("--timeout", type=float, default=settings.REQUEST_TIMEOUT_S,
+                        help=f"Seconds to wait per request (default: "
+                             f"{settings.REQUEST_TIMEOUT_S}). Each request is retried "
+                             f"{settings.RETRIES} times.")
     parser.add_argument("--out", type=Path, default=Path("eval"),
                         help="Where to write reports and summary.md (default: ./eval).")
     args = parser.parse_args(argv)
@@ -191,8 +208,9 @@ def main(argv=None) -> int:
 
     try:
         key = brine.load_key()
-        client = brine.Client(key)
-        models = args.models.split(",") if args.models else client.models()
+        client = brine.Client(key, timeout=args.timeout)
+        models = (args.models.split(",") if args.models
+                  else [m for m in client.models() if brine.is_chat_model(m)])
     except brine.BrineError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
@@ -208,7 +226,7 @@ def main(argv=None) -> int:
             print(f"{model} on {name} ...", flush=True)
             start = time.monotonic()
             try:
-                completion = client.chat(model, system, user)
+                completion = client.chat(model, system, user, max_tokens=args.max_tokens)
             except brine.BrineError as e:
                 scores.append(Score(model, name, error=str(e)[:200]))
                 continue
@@ -218,6 +236,7 @@ def main(argv=None) -> int:
             target.write_text(report)
             s = score(model, name, report, prompt_md, bundle)
             s.latency_s = time.monotonic() - start
+            s.finish_reason, s.usage = completion.finish_reason, completion.usage
             scores.append(s)
 
     table = summary_table(scores)

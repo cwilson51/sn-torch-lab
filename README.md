@@ -232,4 +232,4 @@ torch-lab analyze-traces ./traces --no-llm --output-dir reports/demo
 uv run python scripts/eval_models.py reports/demo --models DeepSeek-V4-Flash-0731,Qwen3.8-27B
 ```
 
-The reports and a ranked `summary.md` go to `./eval`. It needs the same `BRINE_BASE_URL` and key as `analyze-traces`. The checks catch made-up content, not weak advice, so read a few of the reports too.
+Without `--models`, every chat model on Brine is tried; embedding, speech and proxy-alias models are skipped. Reasoning models spend output tokens on thinking, and large models can be slow, so give them room with `--max-tokens` (default 6144, as `analyze-traces` uses) and `--timeout` (seconds per request, default 300), e.g. `--max-tokens 16000 --timeout 900`. The reports and a ranked `summary.md` go to `./eval` (change with `--out`); the summary also records each answer's finish reason and token usage. It needs the same `BRINE_BASE_URL` and key as `analyze-traces`. The checks catch made-up content, not weak advice, so read a few of the reports too.
