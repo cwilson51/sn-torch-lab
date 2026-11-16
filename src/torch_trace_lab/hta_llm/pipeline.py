@@ -11,8 +11,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from torch_trace_lab.hta_llm import (analyses, brine, bundle, context, heuristics, ingest,
-                                     normalize, report, sanitize, settings)
+from torch_trace_lab.hta_llm import (analyses, brine, bundle, context, heuristics, infer, ingest,
+                                     meta, normalize, report, sanitize, settings)
 
 
 @dataclass
@@ -24,6 +24,7 @@ class Options:
     top_n: int = settings.TOP_N
     model: str | None = None
     no_llm: bool = False
+    meta: Path | None = None
 
 
 class Log:
@@ -75,7 +76,18 @@ def analyze(opts: Options, log: Log) -> tuple[dict, str]:
         labels = [r.label for r in runs]
         baseline = normalize.resolve_baseline(labels, opts.baseline)
         notes = context.parse_run_notes(opts.run_notes, labels)
-        contexts = context.build_contexts(runs, notes)
+        user = {}
+        if opts.meta:
+            meta_values, meta_warnings = meta.load_meta(opts.meta, labels)
+            for w in meta_warnings:  # log only: they describe the user's file, not the runs
+                log.warn(w)
+            for label, values in meta_values.items():
+                user[label], meta_notes = meta.as_config(values)
+                if meta_notes:
+                    notes[label] = f"{meta_notes}; {notes[label]}" if label in notes else meta_notes
+        inferred = {r.label: infer.infer_config(r.rank0.evidence) for r in runs}
+        contexts, conflicts = context.build_contexts(runs, notes, inferred=inferred, user=user)
+        warnings += conflicts
         for w in warnings:
             log.warn(w)
         scenario = "S1" if len(runs) == 1 else "S2"

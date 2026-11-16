@@ -13,7 +13,7 @@ from torch_trace_lab.hta_llm.heuristics import Flag
 from torch_trace_lab.hta_llm.normalize import (CATEGORIES, RunMetrics, category_comparison,
                                                kernel_comparison, step_time_differences)
 
-SCHEMA = "torch-lab-hta-bundle/1"
+SCHEMA = "torch-lab-hta-bundle/2"
 PATHLIKE = re.compile(r"(?:[A-Za-z]:)?(?:/[^/\s]+){2,}/")
 
 METRIC_FIELDS = [
@@ -106,9 +106,26 @@ def build(*, scenario: str, metrics: list[RunMetrics], contexts: list[RunContext
 
 
 def _fmt(value) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
     if isinstance(value, dict):
         return ", ".join(f"{k}={v}" for k, v in value.items())
     return tables._cell(value)
+
+
+def _config_cell(entry: dict) -> str:
+    source = entry["source"]
+    if source == "inferred" and entry.get("confidence"):
+        source = f"inferred, {entry['confidence']}"
+    return f"{_fmt(entry['value'])} ({source})"
+
+
+def _diff_cell(row: dict, label: str) -> str:
+    value = _fmt(row["values"][label])
+    source = row.get("sources", {}).get(label)
+    if row["source"] == "mixed" and source not in (None, "unknown"):
+        return f"{value} ({source})"
+    return value
 
 
 def render_markdown(b: dict) -> str:
@@ -133,13 +150,23 @@ def render_markdown(b: dict) -> str:
         row = {"field": k}
         for r in runs:
             if k in r["config"]:
-                row[r["label"]] = f"{_fmt(r['config'][k]['value'])} ({r['config'][k]['source']})"
+                row[r["label"]] = _config_cell(r["config"][k])
             elif k in r["facts"]:
                 row[r["label"]] = f"{_fmt(r['facts'][k])} (trace)"
             else:
                 row[r["label"]] = "unknown"
         rows.append(row)
     out += [tables.render(rows, ["field", *labels]), ""]
+    out += ["Sources: trace = trace metadata; embedded = the trace's torch_lab config; "
+            "user = the user's --meta file; inferred = derived by torch-lab from the trace "
+            "contents, with a confidence. Inferred values are evidence, not fact.", ""]
+    evidence = [(r["label"], k, e) for r in runs for k, e in r["config"].items()
+                if e["source"] == "inferred" and e.get("evidence")]
+    if evidence:
+        out += ["### Evidence for inferred values", ""]
+        out += [f"- {label}: {k} = {_fmt(e['value'])}: {e['evidence']}."
+                for label, k, e in evidence]
+        out.append("")
     for r in runs:
         if r["notes"]:
             out.append(f"- Notes for {r['label']} (from the user): {r['notes']}")
@@ -150,7 +177,7 @@ def render_markdown(b: dict) -> str:
         out += ["### Config diff", ""]
         if b["config_diff"]:
             diff_rows = [{"field": d["field"], "source": d["source"],
-                          **{lbl: _fmt(d["values"][lbl]) for lbl in labels}}
+                          **{lbl: _diff_cell(d, lbl) for lbl in labels}}
                          for d in b["config_diff"]]
             out.append(tables.render(diff_rows, ["field", "source", *labels]))
         else:
