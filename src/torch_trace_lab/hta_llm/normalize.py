@@ -170,10 +170,14 @@ class RunMetrics:
     gpu_non_compute_pct: float | None = None
     idle_ms_per_step: float | None = None
     host_wait_pct_of_idle: float | None = None
+    host_wait_ms_per_step: float | None = None
     kernel_wait_pct_of_idle: float | None = None
     other_idle_pct_of_idle: float | None = None
     kernel_ms_per_step: float | None = None
     kernels: list[KernelRow] = field(default_factory=list)   # top-N + REMAINING
+    # ms/step of every kernel in the run, by short name. Used to join runs; not rendered,
+    # so a kernel outside one run's top N still shows its real time in comparisons.
+    all_kernels: dict[str, float] = field(default_factory=dict)
     top_kernel_pct: float | None = None
     top_kernel: str | None = None
     memcpy_pct: float | None = None
@@ -209,6 +213,8 @@ def normalize_run(label: str, a: RunAnalysis, *, top_n: int = settings.TOP_N,
     if a.idle is not None and not a.idle.empty:
         ratios = dict(zip(a.idle["category"], a.idle["ratio"]))
         m.host_wait_pct_of_idle = r1(100 * ratios.get("host_wait", 0.0))
+        host_us = a.idle.loc[a.idle["category"] == "host_wait", "idle_us"].sum()
+        m.host_wait_ms_per_step = r2(host_us / div / 1000)
         m.kernel_wait_pct_of_idle = r1(100 * ratios.get("kernel_wait", 0.0))
         m.other_idle_pct_of_idle = r1(100 * ratios.get("other", 0.0))
 
@@ -218,6 +224,7 @@ def normalize_run(label: str, a: RunAnalysis, *, top_n: int = settings.TOP_N,
         m.kernel_ms_per_step = r2(total / div / 1000)
         for full in k["name"]:
             add_short_name(names, full)
+        m.all_kernels = {names[n]: r2(s / div / 1000) for n, s in zip(k["name"], k["sum_us"])}
         rows = []
         for _, row in k.head(top_n).iterrows():
             rows.append(KernelRow(
@@ -268,11 +275,12 @@ def normalize_run(label: str, a: RunAnalysis, *, top_n: int = settings.TOP_N,
 
 
 def kernel_comparison(runs: list[RunMetrics], baseline: int = 0) -> list[dict]:
-    """Join per-run top-N kernel tables on short name, with ms/step deltas vs. the baseline.
+    """Join kernels across runs on short name, with ms/step deltas vs. the baseline.
 
-    Only kernels in the top-N of at least two runs are joined: torch.compile replaces most
-    eager kernels, so kernels unique to one run add rows without explaining differences.
-    The category comparison covers those.
+    Rows are the kernels in any run's top N that occur in at least two runs; kernels unique
+    to one run (e.g. after torch.compile replaces eager kernels) are left to the category
+    comparison. Values come from each run's full kernel list, so None means the kernel does
+    not occur in that run at all, not merely that it fell outside the top N.
     """
     order: list[str] = []
     for r in runs:
@@ -282,8 +290,7 @@ def kernel_comparison(runs: list[RunMetrics], baseline: int = 0) -> list[dict]:
     base = runs[baseline]
     rows = []
     for short in order:
-        values = {r.label: next((k.ms_per_step for k in r.kernels if k.short == short), None)
-                  for r in runs}
+        values = {r.label: r.all_kernels.get(short) for r in runs}
         if sum(v is not None for v in values.values()) < 2:
             continue
         b = values[base.label] or 0.0
@@ -292,6 +299,19 @@ def kernel_comparison(runs: list[RunMetrics], baseline: int = 0) -> list[dict]:
             if r is not base:
                 row[f"Δ {r.label}"] = r2((values[r.label] or 0.0) - b)
         rows.append(row)
+    return rows
+
+
+def step_time_differences(runs: list[RunMetrics]) -> list[dict]:
+    """Step-time difference for every ordered pair of runs: ``to`` minus ``from``."""
+    rows = []
+    for a in runs:
+        for b in runs:
+            if a is b or not a.step_time_ms or not b.step_time_ms:
+                continue
+            delta = b.step_time_ms - a.step_time_ms
+            rows.append({"from": a.label, "to": b.label, "delta_ms": r2(delta),
+                         "delta_pct": r1(100 * delta / a.step_time_ms)})
     return rows
 
 

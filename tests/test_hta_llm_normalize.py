@@ -121,6 +121,7 @@ def test_per_step_means_and_rounding():
     assert m.step_time_ms == 10.0
     assert m.idle_ms_per_step == 2.0
     assert m.host_wait_pct_of_idle == 75.0
+    assert m.host_wait_ms_per_step == 1.5   # 3000 µs over 2 steps
     assert m.kernels[0].ms_per_step == 1.67      # 3333.333 us / 2 steps
     assert m.kernels[0].pct_gpu == 76.9
     assert m.kernels[0].precision == "fp32"
@@ -154,6 +155,28 @@ def test_kernel_comparison_and_baseline():
     assert total["a"] == 1.5 and total["b"] == 0.75 and total["Δ% b"] == -50.0
     with pytest.raises(ValueError, match="not one of the runs"):
         normalize.resolve_baseline(["a", "b"], "c")
+
+
+def test_shared_kernel_outside_top_n_shows_real_time():
+    """A kernel in one run's top N but below another's still shows its real ms/step."""
+    names = {}
+    a = normalize.normalize_run("a", fake_analysis({"big": 4000, "copy": 2000}), top_n=2,
+                                names=names)
+    b = normalize.normalize_run("b", fake_analysis({"x": 9000, "y": 8000, "copy": 1000}),
+                                top_n=2, names=names)
+    rows = normalize.kernel_comparison([a, b])
+    copy = next(r for r in rows if r["kernel"] == "copy")
+    assert copy["a"] == 1.0 and copy["b"] == 0.5   # "copy" is not in b's top 2
+    assert [r["kernel"] for r in rows] == ["copy"]  # "big", "x", "y" occur in one run only
+
+
+def test_step_time_differences_cover_every_pair():
+    runs = [normalize.RunMetrics("a", 9, 200.0), normalize.RunMetrics("b", 9, 150.0),
+            normalize.RunMetrics("c", 9, 100.0)]
+    diffs = {(d["from"], d["to"]): d for d in normalize.step_time_differences(runs)}
+    assert len(diffs) == 6
+    assert diffs[("b", "c")] == {"from": "b", "to": "c", "delta_ms": -50.0, "delta_pct": -33.3}
+    assert diffs[("c", "a")]["delta_ms"] == 100.0 and diffs[("c", "a")]["delta_pct"] == 100.0
 
 
 def test_tables_render():

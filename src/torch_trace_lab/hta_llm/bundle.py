@@ -11,14 +11,15 @@ from torch_trace_lab.hta_llm import tables
 from torch_trace_lab.hta_llm.context import RunContext
 from torch_trace_lab.hta_llm.heuristics import Flag
 from torch_trace_lab.hta_llm.normalize import (CATEGORIES, RunMetrics, category_comparison,
-                                               kernel_comparison)
+                                               kernel_comparison, step_time_differences)
 
 SCHEMA = "torch-lab-hta-bundle/1"
 PATHLIKE = re.compile(r"(?:[A-Za-z]:)?(?:/[^/\s]+){2,}/")
 
 METRIC_FIELDS = [
     "steps", "step_time_ms", "samples_per_s", "gpu_idle_pct", "gpu_compute_pct",
-    "gpu_non_compute_pct", "idle_ms_per_step", "host_wait_pct_of_idle", "kernel_wait_pct_of_idle",
+    "gpu_non_compute_pct", "idle_ms_per_step", "host_wait_pct_of_idle",
+    "host_wait_ms_per_step", "kernel_wait_pct_of_idle",
     "other_idle_pct_of_idle", "kernel_ms_per_step", "top_kernel", "top_kernel_pct", "memcpy_pct",
     "gemm_conv_precision_pct", "categories", "category_pct", "kernels_per_step",
     "median_kernel_us", "median_launch_cpu_us",
@@ -41,6 +42,12 @@ DESCRIPTIONS = {
               "not that launches are slow.",
     "derived": "Computed by torch-lab, not by HTA. Throughput needs the batch size. "
                "Deltas are against the baseline run, in ms and %.",
+    "differences": "Each cell is the column run's step time minus the row run's step time; "
+                   "the % is relative to the row run. Negative means the column run is faster. "
+                   "Quote these instead of subtracting step times.",
+    "shared": "Kernels from any run's top list that occur in at least two runs. Values are "
+              "each run's full ms/step for that kernel, even when it is outside that run's top "
+              "list; '–' means the kernel does not occur in that run at all.",
 }
 
 
@@ -92,6 +99,7 @@ def build(*, scenario: str, metrics: list[RunMetrics], contexts: list[RunContext
         "kernel_comparison": kernel_comparison(metrics, baseline) if len(metrics) > 1 else [],
         "category_comparison": category_comparison(metrics, baseline) if len(metrics) > 1 else [],
         "derived": derived,
+        "step_time_differences": step_time_differences(metrics) if len(metrics) > 1 else [],
         "data_quality": list(data_quality),
         "kernel_names": names,
     }
@@ -184,7 +192,8 @@ def render_markdown(b: dict) -> str:
                           ("idle_ms_per_step", "idle (ms/step)"),
                           ("kernel_ms_per_step", "kernel time (ms/step)")]), ""]
     out += ["## 5. Idle time breakdown", "", DESCRIPTIONS["idle"], "",
-            metric_table([("host_wait_pct_of_idle", "host wait % of idle"),
+            metric_table([("host_wait_ms_per_step", "host wait (ms/step)"),
+                          ("host_wait_pct_of_idle", "host wait % of idle"),
                           ("kernel_wait_pct_of_idle", "kernel wait % of idle"),
                           ("other_idle_pct_of_idle", "other % of idle")]), ""]
 
@@ -200,7 +209,7 @@ def render_markdown(b: dict) -> str:
                                for c in CATEGORIES if c in r["metrics"]["categories"]]), ""]
     if b["kernel_comparison"]:
         out += [f"### Kernels shared by several runs (ms/step; Δ vs. {b['baseline']})", "",
-                tables.render(b["kernel_comparison"]), ""]
+                DESCRIPTIONS["shared"], "", tables.render(b["kernel_comparison"]), ""]
     kcols = ["short", "kernel_type", "ms_per_step", "pct_gpu", "calls_per_step", "mean_us",
              "precision"]
     kheads = {"short": "kernel", "kernel_type": "type", "ms_per_step": "ms/step",
@@ -223,6 +232,17 @@ def render_markdown(b: dict) -> str:
 
     out += ["## 8. Derived metrics", "", DESCRIPTIONS["derived"], "",
             tables.render(b["derived"]), ""]
+    if b["step_time_differences"]:
+        diffs = {(d["from"], d["to"]): d for d in b["step_time_differences"]}
+        matrix = []
+        for a in labels:
+            row = {"from \\ to": a}
+            for c in labels:
+                d = diffs.get((a, c))
+                row[c] = "–" if d is None else f"{d['delta_ms']:+.2f} ms ({d['delta_pct']:+.1f}%)"
+            matrix.append(row)
+        out += ["### Step-time difference between any two runs", "",
+                DESCRIPTIONS["differences"], "", tables.render(matrix), ""]
 
     if b["kernel_names"]:
         out += ["## Appendix: kernel names", "",
