@@ -7,6 +7,7 @@ These are fixed ResNet50 examples, not a tool for profiling your own code.
 * On an Alliance login node -> offer to submit a batch job that runs them.
 """
 
+import argparse
 import os
 import subprocess
 import sys
@@ -44,14 +45,52 @@ def trace_runs(batch_size: int, output_dir: Path) -> list[tuple[str, list[str]]]
     ]
 
 
+def batch_size_arg(value: str) -> str | int:
+    """argparse type for --batch-size: ``auto`` or a positive integer."""
+    if value == "auto":
+        return value
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"must be 'auto' or a positive integer, not {value!r}")
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, not {n}")
+    return n
+
+
+def resolve_batch_size(value: str | int) -> int | None:
+    """Return the batch size to use, probing the GPU when ``value`` is ``auto``.
+
+    The probe runs in a subprocess so this process never creates a CUDA context, which
+    would hold GPU memory while the training runs need it. Returns None if probing fails.
+    """
+    if value != "auto":
+        return int(value)
+    proc = subprocess.run(
+        [sys.executable, "-m", "torch_trace_lab.batch_size"], stdout=subprocess.PIPE, text=True
+    )
+    lines = (proc.stdout or "").strip().splitlines()
+    if proc.returncode != 0 or not lines or not lines[-1].strip().isdigit():
+        return None
+    return int(lines[-1])
+
+
 def run_traces(args) -> int:
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    batch_size = resolve_batch_size(args.batch_size)
+    if batch_size is None:
+        print("Could not detect a batch size automatically; pass --batch-size N instead.",
+              file=sys.stderr)
+        return 1
+    if args.batch_size == "auto":
+        print(f"Batch size: {batch_size} (auto-detected)")
+
     results = []
-    for name, run_args in trace_runs(args.batch_size, output_dir):
+    for name, run_args in trace_runs(batch_size, output_dir):
         print("=" * 53)
-        print(f"{name} (batch size {args.batch_size}):")
+        print(f"{name} (batch size {batch_size}):")
         print("=" * 53, flush=True)
         proc = subprocess.run([sys.executable, "-m", "torch_trace_lab.train", *run_args])
         results.append((name, proc.returncode == 0))
@@ -151,8 +190,9 @@ def add_parser(subparsers) -> None:
     )
     parser.add_argument("--output-dir", default="traces",
                         help="Directory for traces (default: ./traces).")
-    parser.add_argument("--batch-size", type=int, default=128,
-                        help="Training batch size (default: 128).")
+    parser.add_argument("--batch-size", type=batch_size_arg, default="auto",
+                        help="Training batch size, or 'auto' to pick the largest power of 2 "
+                             "that fits in GPU memory, up to 512 (32 on CPU). Default: auto.")
     job = parser.add_argument_group("batch job options (Alliance login nodes only)")
     job.add_argument("--account", help="Slurm account, e.g. def-someuser.")
     job.add_argument("--time", default="0-00:30:00", help="Job time limit (default: 0-00:30:00).")

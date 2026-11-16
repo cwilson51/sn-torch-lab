@@ -127,3 +127,59 @@ def test_no_subcommand_is_an_error(capsys):
     with pytest.raises(SystemExit) as exc:
         cli.main([])
     assert exc.value.code == 2
+
+
+@pytest.fixture
+def train_runs(monkeypatch):
+    """Fake subprocess.run: the batch-size probe prints `probe_output`, train runs succeed."""
+    record = SimpleNamespace(train=[], probes=0, probe_output="256\n", probe_code=0)
+
+    def fake_run(cmd, **kwargs):
+        if cmd[-1] == "torch_trace_lab.batch_size":
+            record.probes += 1
+            return SimpleNamespace(returncode=record.probe_code, stdout=record.probe_output)
+        record.train.append(cmd)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(et.subprocess, "run", fake_run)
+    return record
+
+
+def batch_sizes(train_cmds):
+    return {cmd[cmd.index("torch_trace_lab.train") + 1] for cmd in train_cmds}
+
+
+def test_auto_batch_size_probes_once(train_runs, tmp_path, capsys):
+    assert cli.main([CMD, "--output-dir", str(tmp_path)]) == 0
+    assert train_runs.probes == 1
+    assert len(train_runs.train) == 4
+    assert batch_sizes(train_runs.train) == {"256"}
+    assert "Batch size: 256 (auto-detected)" in capsys.readouterr().out
+
+
+def test_explicit_batch_size_skips_probe(train_runs, tmp_path):
+    assert cli.main([CMD, "--output-dir", str(tmp_path), "--batch-size", "64"]) == 0
+    assert train_runs.probes == 0
+    assert batch_sizes(train_runs.train) == {"64"}
+
+
+@pytest.mark.parametrize("code, output", [(1, ""), (0, "not a number\n")])
+def test_failed_probe_returns_error(train_runs, tmp_path, capsys, code, output):
+    train_runs.probe_code, train_runs.probe_output = code, output
+    assert cli.main([CMD, "--output-dir", str(tmp_path)]) == 1
+    assert train_runs.train == []
+    assert "--batch-size N" in capsys.readouterr().err
+
+
+def test_job_script_defers_auto_to_compute_node(monkeypatch, train_runs, tmp_path, capsys):
+    monkeypatch.setenv("CC_CLUSTER", "nibi")
+    assert cli.main([CMD, "--output-dir", str(tmp_path), "--account", "def-x", "--dry-run"]) == 0
+    assert "--batch-size auto" in capsys.readouterr().out
+    assert train_runs.probes == 0
+
+
+@pytest.mark.parametrize("value", ["0", "-4", "foo"])
+def test_invalid_batch_size(value, capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main([CMD, "--batch-size", value])
+    assert exc.value.code == 2
