@@ -31,13 +31,16 @@ DESCRIPTIONS = {
     "idle": "Why the GPU was idle: host_wait = waiting for the CPU to launch work; "
             "kernel_wait = short gaps between back-to-back kernels; other = anything else.",
     "kernels": "GPU kernel time per step, first by category, then the top kernels by name "
-               "(the rest are collapsed into 'other'). Categories line up across eager and "
-               "torch.compile runs, whose kernel names differ.",
+               "(the rest are collapsed into '(remaining kernels)'). Categories line up across "
+               "eager and torch.compile runs, whose kernel names differ; 'uncategorized' holds "
+               "kernels that fit no category. Category and top-kernel tables are separate "
+               "views of the same time: don't add them together.",
     "launch": "CPU-side kernel launches: how long kernels run vs. how long launches take. "
               "Launch delay is the time from a launch call to the kernel starting on the GPU; "
               "a large delay means the CPU is running ahead of a busy GPU (queued work), "
               "not that launches are slow.",
-    "derived": "Computed by torch-lab, not by HTA. Throughput needs the batch size.",
+    "derived": "Computed by torch-lab, not by HTA. Throughput needs the batch size. "
+               "Deltas are against the baseline run, in ms and %.",
 }
 
 
@@ -70,11 +73,13 @@ def build(*, scenario: str, metrics: list[RunMetrics], contexts: list[RunContext
         row = {"run": m.label, "step_time_ms": m.step_time_ms, "samples_per_s": m.samples_per_s}
         if len(metrics) > 1:
             if m.step_time_ms and base.step_time_ms:
+                row["step_time_vs_baseline_ms"] = round(m.step_time_ms - base.step_time_ms, 2)
                 row["step_time_vs_baseline_pct"] = round(
                     100 * (m.step_time_ms - base.step_time_ms) / base.step_time_ms, 1)
                 row["speedup_vs_baseline"] = round(base.step_time_ms / m.step_time_ms, 2)
             else:
-                row["step_time_vs_baseline_pct"] = row["speedup_vs_baseline"] = None
+                row["step_time_vs_baseline_ms"] = row["step_time_vs_baseline_pct"] = None
+                row["speedup_vs_baseline"] = None
         derived.append(row)
     return {
         "schema": SCHEMA,

@@ -83,6 +83,7 @@ def test_shorten_real_names(full, short):
     (ADD, "elementwise/reduction", None),
     (MTA, "optimizer", None),
     ("Memcpy HtoD (Pageable -> Device)", "memcpy/memset", None),
+    ("my_custom_cuda_kernel", "uncategorized", None),
 ])
 def test_kernel_category_and_precision(name, category, precision):
     """cuDNN batch-norm/layout kernels and Triton fused kernels are not GEMM/conv."""
@@ -131,7 +132,7 @@ def test_per_step_means_and_rounding():
 def test_top_n_collapses_other():
     sums = {f"k{i}": 100 * (10 - i) for i in range(10)}
     m = normalize.normalize_run("a", fake_analysis(sums), top_n=3)
-    assert [k.short for k in m.kernels] == ["k0", "k1", "k2", "other"]
+    assert [k.short for k in m.kernels] == ["k0", "k1", "k2", "(remaining kernels)"]
     assert m.kernels[-1].ms_per_step == pytest.approx((sum(sums.values()) - 2700) / 2 / 1000,
                                                       abs=0.01)
 

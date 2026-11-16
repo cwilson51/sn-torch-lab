@@ -108,6 +108,10 @@ def test_no_llm_writes_everything(two_runs, tmp_path, fake_brine):
     serial = next(r for r in b["runs"] if r["label"] == "serial")
     assert {f["id"] for f in serial["flags"]} >= {"GPU_IDLE_HIGH", "HOST_BOUND", "NO_AMP_SUSPECTED"}
     assert {d["field"] for d in b["config_diff"]} == {"precision", "dataloader_workers"}
+    serial_derived = next(r for r in b["derived"] if r["run"] == "serial")
+    amp_derived = next(r for r in b["derived"] if r["run"] == "amp")
+    assert serial_derived["step_time_vs_baseline_ms"] == round(
+        serial_derived["step_time_ms"] - amp_derived["step_time_ms"], 2)
     report = (out / "report.md").read_text()
     assert "flags only" in report and "HOST_BOUND" in report
 

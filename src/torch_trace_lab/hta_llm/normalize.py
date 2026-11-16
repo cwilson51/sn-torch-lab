@@ -35,8 +35,12 @@ def is_gemm_or_conv(name: str) -> bool:
     return bool(GEMM_CONV.search(name)) and not NOT_GEMM_CONV.search(name)
 
 
+# The top-N table's row for all kernels below the top N. Deliberately not "other", which
+# would be confused with a kernel category.
+REMAINING = "(remaining kernels)"
+
 CATEGORIES = ("GEMM/conv", "fused (torch.compile)", "batch norm", "layout transpose",
-              "elementwise/reduction", "optimizer", "memcpy/memset", "other")
+              "elementwise/reduction", "optimizer", "memcpy/memset", "uncategorized")
 
 
 def kernel_category(name: str) -> str:
@@ -55,7 +59,7 @@ def kernel_category(name: str) -> str:
         return "optimizer"
     if re.search(r"elementwise|reduce|reduction", name, re.I):
         return "elementwise/reduction"
-    return "other"
+    return "uncategorized"
 
 
 # Kernel names that say nothing without their template arguments.
@@ -169,7 +173,7 @@ class RunMetrics:
     kernel_wait_pct_of_idle: float | None = None
     other_idle_pct_of_idle: float | None = None
     kernel_ms_per_step: float | None = None
-    kernels: list[KernelRow] = field(default_factory=list)   # top-N + "other"
+    kernels: list[KernelRow] = field(default_factory=list)   # top-N + REMAINING
     top_kernel_pct: float | None = None
     top_kernel: str | None = None
     memcpy_pct: float | None = None
@@ -225,7 +229,7 @@ def normalize_run(label: str, a: RunAnalysis, *, top_n: int = settings.TOP_N,
             ))
         rest = k.iloc[top_n:]
         if not rest.empty:
-            rows.append(KernelRow("other", "-", r2(rest["sum_us"].sum() / div / 1000),
+            rows.append(KernelRow(REMAINING, "-", r2(rest["sum_us"].sum() / div / 1000),
                                   r1(100 * rest["sum_us"].sum() / total) if total else 0.0,
                                   r1(rest["count"].sum() / div), r2(rest["mean_us"].mean()), None))
         m.kernels = rows
@@ -273,7 +277,7 @@ def kernel_comparison(runs: list[RunMetrics], baseline: int = 0) -> list[dict]:
     order: list[str] = []
     for r in runs:
         for k in r.kernels:
-            if k.short != "other" and k.short not in order:
+            if k.short != REMAINING and k.short not in order:
                 order.append(k.short)
     base = runs[baseline]
     rows = []
