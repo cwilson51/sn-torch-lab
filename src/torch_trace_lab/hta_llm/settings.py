@@ -18,7 +18,7 @@ NO_AMP_FP32_SHARE_PCT = 50.0      # fp32/tf32 GEMM+conv time > this % of GEMM+co
 # Prompt size. Brine chat models allow 131,072 tokens in + out.
 CONTEXT_TOKENS = 131_072
 MAX_PROMPT_TOKENS = 24_000
-CHARS_PER_TOKEN = 3.0  # conservative estimate
+CHARS_PER_TOKEN = 2.5  # conservative: the demo prompt measured ~2.6 chars/token on Brine
 
 # Brine
 BRINE_BASE_URL = "https://brine.sharcnet.ca/v1"
