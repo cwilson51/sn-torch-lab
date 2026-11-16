@@ -2520,6 +2520,7 @@ dependencies = [
     { name = "torchvision" },
     { name = "tqdm" },
     { name = "traceinsight" },
+    { name = "triton", marker = "sys_platform == 'linux'" },
 ]
 
 [package.optional-dependencies]
@@ -2540,6 +2541,7 @@ requires-dist = [
     { name = "torchvision", specifier = ">=0.29.2" },
     { name = "tqdm", specifier = ">=4.70.1" },
     { name = "traceinsight", specifier = ">=0.6.1" },
+    { name = "triton", marker = "sys_platform == 'linux'", specifier = ">=3.6.0" },
 ]
 provides-extras = ["presentation", "dev"]
 
