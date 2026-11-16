@@ -620,26 +620,6 @@ wheels = [
 ]
 
 [[package]]
-name = "holistictraceanalysis"
-version = "0.5.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "jupyterlab" },
-    { name = "networkx", version = "3.6.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "networkx", version = "3.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "pandas" },
-    { name = "plotly" },
-    { name = "pydot" },
-    { name = "pytest" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/f7/92/b069b3831ae95e0b6cdb193bf943b5128e78c2b85656a69d60cc6b97b82d/holistictraceanalysis-0.5.0.tar.gz", hash = "sha256:731b22cfd94f907ad06a1c751187b81e073242cd81fb987bf345f068801371ba", size = 354167, upload-time = "2025-05-29T21:05:55.728Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/bb/2e/9db9a4b5e2c307264497ca2a9a92ed4d2ca1b31890d55cbe53d1bbdafcd0/holistictraceanalysis-0.5.0-py3-none-any.whl", hash = "sha256:dbb4d461ff5ea7488207e07de5e2f52aeb5d82837ec6acfe57e1f0a124972ec3", size = 371233, upload-time = "2025-05-29T21:05:54.011Z" },
-]
-
-[[package]]
 name = "httpcore"
 version = "1.0.9"
 source = { registry = "https://pypi.org/simple" }
@@ -2534,11 +2514,11 @@ name = "torch-trace-lab"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "holistictraceanalysis" },
     { name = "jupyterlab" },
     { name = "torch" },
     { name = "torchvision" },
     { name = "tqdm" },
+    { name = "traceinsight" },
 ]
 
 [package.optional-dependencies]
@@ -2551,13 +2531,13 @@ presentation = [
 
 [package.metadata]
 requires-dist = [
-    { name = "holistictraceanalysis", specifier = ">=0.5.0" },
     { name = "jupyterlab", specifier = ">=4.6.6" },
     { name = "jupyterlab-rise", marker = "extra == 'presentation'", specifier = ">=0.43.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "torch", specifier = ">=2.14.0" },
     { name = "torchvision", specifier = ">=0.29.2" },
     { name = "tqdm", specifier = ">=4.70.1" },
+    { name = "traceinsight", specifier = ">=0.6.1" },
 ]
 provides-extras = ["presentation", "dev"]
 
@@ -2638,6 +2618,25 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/0d/ea/b2a5bd54b28a324dae8211928b2d730b6547500342c7e6c6dea08bd0a485/tqdm-4.70.1.tar.gz", hash = "sha256:cefd0eca11b2a37a3aee776544d4f4ae913f02688135b5556b8788dfa474afc4", size = 171846, upload-time = "2026-09-11T07:25:16.601Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a7/03/921a3d3c75785aca9ebfbfcabfbc3a1be12e2ab5265deb026d55a5a3f83e/tqdm-4.70.1-py3-none-any.whl", hash = "sha256:c293e525e6fef9c20e8728fd4612df02a0aa31bb5fe91ecd93e123b1b7bffa73", size = 80199, upload-time = "2026-09-11T07:25:14.599Z" },
+]
+
+[[package]]
+name = "traceinsight"
+version = "0.6.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "jupyterlab" },
+    { name = "networkx", version = "3.6.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "networkx", version = "3.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "pandas" },
+    { name = "plotly" },
+    { name = "pydot" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/9c/6e/55ba5227b3fdfa62d7ac37570f4e21cfd2809426be74da8e57ac81ed34b1/traceinsight-0.6.1.tar.gz", hash = "sha256:be800b6f21f0e98cfb2580e3b57585c8fe799d9dae8fcbe4cc3f66cb9f3bef0f", size = 194036, upload-time = "2026-04-21T22:27:23.418Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/81/28/fef3002accc40b52c5df5066f6f4caa46909674c0a056d3c52422eea86c3/traceinsight-0.6.1-py3-none-any.whl", hash = "sha256:23d239caaa349a0bd5278ecd4cb38e6fa8ed58f3dfd9eaf30fa23113999ae667", size = 154181, upload-time = "2026-04-21T22:27:21.649Z" },
 ]
 
 [[package]]
