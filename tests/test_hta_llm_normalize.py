@@ -23,9 +23,74 @@ def test_shorten():
     full = ("void at::native::vectorized_elementwise_kernel<4, at::native::AddFunctor<float>, "
             "at::detail::Array<char*, 3> >(int, at::native::AddFunctor<float>, "
             "at::detail::Array<char*, 3>)")
-    assert normalize.shorten(full) == "vectorized_elementwise_kernel"
+    assert normalize.shorten(full) == "vectorized_elementwise_kernel<AddFunctor>"
     assert normalize.shorten("/home/jdoe/x/my_kernel") == "my_kernel"
     assert len(normalize.shorten("k" * 200)) == 60
+
+
+# Real kernel names from the demo traces (H100, torch 2.14).
+THRESHOLD = ("void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, "
+             "float, float, at::native::(anonymous namespace)::threshold_kernel_impl<float>("
+             "at::TensorIteratorBase&, float, float)::{lambda(float, float)#1}>, "
+             "std::array<char*, 3ul>, false>(int, at::native::BinaryFunctor<float, float, float>)")
+CLAMP = ("void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::"
+         "launch_clamp_scalar(at::TensorIteratorBase&, c10::Scalar, c10::Scalar, at::native::"
+         "detail::ClampLimits)::{lambda()#1}::operator()() const::{lambda()#7}::operator()() "
+         "const::{lambda(float)#1}, std::array<char*, 2ul>, false>(int, float, "
+         "std::array<char*, 2ul>)")
+ADD = ("void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<float>, "
+       "std::array<char*, 3ul>, false>(int, at::native::CUDAFunctor_add<float>, "
+       "std::array<char*, 3ul>)")
+CUTLASS = ("void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x64_16x6_tn_align4>("
+           "cutlass_80_tensorop_s1688gemm_128x64_16x6_tn_align4::Params)")
+MTA = ("void at::native::(anonymous namespace)::multi_tensor_apply_kernel<at::native::(anonymous "
+       "namespace)::TensorListMetadata<2>, at::native::(anonymous namespace)::"
+       "BinaryOpListAlphaFunctor<float, 2, 2, 0>, std::plus<float>, float>(at::native::"
+       "(anonymous namespace)::TensorListMetadata<2>, float)")
+BN = ("void cudnn::bn_bw_1C11_kernel_new<float, float, float2, 128, true, 1>(float, float, "
+      "cudnnTensorStruct, float const*)")
+NCHW = ("void cudnn::engines_precompiled::nchwToNhwcKernel<float, float, float, false, true, "
+        "(cudnnKernelDataType_t)0>(cudnn::engines_precompiled::nchw2nhwc_params_t<float>, "
+        "float const*, float*)")
+XMMA_TF32 = ("sm90_xmma_wgrad_indexed_implicit_gemm_f32f32_tf32f32_f32_nhwckrsc_nhwc_"
+             "tilesize128x128x32_warpgroupsize1x1x1_g1_execute_segment_k_off_kernel__5x_cudnn")
+XMMA_F16 = ("sm90_xmma_wgrad_indexed_implicit_gemm_f16f16_f16f32_f32_nhwckrsc_nhwc_"
+            "tilesize128x64x64_warpgroupsize1x1x1_g1_execute_segment_k_off_kernel__5x_cudnn")
+TRITON_BN = ("triton_red_fused__native_batch_norm_legit_functional_convolution_backward_"
+             "native_batch_norm_backward_53")
+
+
+@pytest.mark.parametrize("full, short", [
+    (THRESHOLD, "vectorized_elementwise_kernel<threshold>"),
+    (CLAMP, "vectorized_elementwise_kernel<launch_clamp_scalar>"),
+    (ADD, "vectorized_elementwise_kernel<CUDAFunctor_add>"),
+    (CUTLASS, "Kernel2<cutlass_80_tensorop_s1688gemm_128x64_16x6_tn_align4>"),
+    (MTA, "multi_tensor_apply_kernel<BinaryOpListAlphaFunctor>"),
+    (BN, "bn_bw_1C11_kernel_new"),
+])
+def test_shorten_real_names(full, short):
+    assert normalize.shorten(full) == short
+
+
+@pytest.mark.parametrize("name, category, precision", [
+    (CUTLASS, "GEMM/conv", "tf32"),
+    (XMMA_TF32, "GEMM/conv", "tf32"),
+    (XMMA_F16, "GEMM/conv", "fp16"),
+    (BN, "batch norm", None),
+    (NCHW, "layout transpose", None),
+    (TRITON_BN, "fused (torch.compile)", None),
+    ("triton_tem_fused_mm_0", "GEMM/conv", None),
+    (ADD, "elementwise/reduction", None),
+    (MTA, "optimizer", None),
+    ("Memcpy HtoD (Pageable -> Device)", "memcpy/memset", None),
+])
+def test_kernel_category_and_precision(name, category, precision):
+    """cuDNN batch-norm/layout kernels and Triton fused kernels are not GEMM/conv."""
+    assert normalize.kernel_category(name) == category
+    gemm = normalize.is_gemm_or_conv(name)
+    assert gemm == (category == "GEMM/conv")
+    if gemm:
+        assert normalize.kernel_precision(name) == precision
 
 
 def test_short_name_collisions_are_unique():
@@ -78,11 +143,14 @@ def test_kernel_comparison_and_baseline():
     rows = normalize.kernel_comparison([a, b], baseline=normalize.resolve_baseline(["a", "b"], "a"))
     k1 = next(r for r in rows if r["kernel"] == "k1")
     assert k1["a"] == 1.0 and k1["b"] == 0.5
-    assert k1["Δ b"] == -0.5 and k1["Δ% b"] == -50.0
-    k3 = next(r for r in rows if r["kernel"] == "k3")
-    assert k3["a"] is None and k3["Δ% b"] is None
+    assert k1["Δ b"] == -0.5
+    # Kernels in only one run are left to the category comparison.
+    assert [r["kernel"] for r in rows] == ["k1"]
     rows_b = normalize.kernel_comparison([a, b], baseline=1)
     assert "Δ a" in rows_b[0]
+    cats = normalize.category_comparison([a, b], baseline=0)
+    total = next(r for r in cats if r["category"] == "total")
+    assert total["a"] == 1.5 and total["b"] == 0.75 and total["Δ% b"] == -50.0
     with pytest.raises(ValueError, match="not one of the runs"):
         normalize.resolve_baseline(["a", "b"], "c")
 

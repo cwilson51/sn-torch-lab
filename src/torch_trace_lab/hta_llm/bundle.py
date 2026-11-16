@@ -10,7 +10,8 @@ from dataclasses import asdict
 from torch_trace_lab.hta_llm import tables
 from torch_trace_lab.hta_llm.context import RunContext
 from torch_trace_lab.hta_llm.heuristics import Flag
-from torch_trace_lab.hta_llm.normalize import RunMetrics, kernel_comparison
+from torch_trace_lab.hta_llm.normalize import (CATEGORIES, RunMetrics, category_comparison,
+                                               kernel_comparison)
 
 SCHEMA = "torch-lab-hta-bundle/1"
 PATHLIKE = re.compile(r"(?:[A-Za-z]:)?(?:/[^/\s]+){2,}/")
@@ -19,7 +20,8 @@ METRIC_FIELDS = [
     "steps", "step_time_ms", "samples_per_s", "gpu_idle_pct", "gpu_compute_pct",
     "gpu_non_compute_pct", "idle_ms_per_step", "host_wait_pct_of_idle", "kernel_wait_pct_of_idle",
     "other_idle_pct_of_idle", "kernel_ms_per_step", "top_kernel", "top_kernel_pct", "memcpy_pct",
-    "gemm_conv_precision_pct", "kernels_per_step", "median_kernel_us", "median_launch_cpu_us",
+    "gemm_conv_precision_pct", "categories", "category_pct", "kernels_per_step",
+    "median_kernel_us", "median_launch_cpu_us",
     "median_launch_delay_us", "short_kernel_pct",
 ]
 
@@ -28,8 +30,13 @@ DESCRIPTIONS = {
                 "(memory copy/set) kernels.",
     "idle": "Why the GPU was idle: host_wait = waiting for the CPU to launch work; "
             "kernel_wait = short gaps between back-to-back kernels; other = anything else.",
-    "kernels": "GPU kernels by time per step; the rest are collapsed into 'other'.",
-    "launch": "CPU-side kernel launches: how long kernels run vs. how long launches take.",
+    "kernels": "GPU kernel time per step, first by category, then the top kernels by name "
+               "(the rest are collapsed into 'other'). Categories line up across eager and "
+               "torch.compile runs, whose kernel names differ.",
+    "launch": "CPU-side kernel launches: how long kernels run vs. how long launches take. "
+              "Launch delay is the time from a launch call to the kernel starting on the GPU; "
+              "a large delay means the CPU is running ahead of a busy GPU (queued work), "
+              "not that launches are slow.",
     "derived": "Computed by torch-lab, not by HTA. Throughput needs the batch size.",
 }
 
@@ -78,6 +85,7 @@ def build(*, scenario: str, metrics: list[RunMetrics], contexts: list[RunContext
         "config_diff": config_diff if len(metrics) > 1 else [],
         "configs_distinguishable": distinguishable if len(metrics) > 1 else None,
         "kernel_comparison": kernel_comparison(metrics, baseline) if len(metrics) > 1 else [],
+        "category_comparison": category_comparison(metrics, baseline) if len(metrics) > 1 else [],
         "derived": derived,
         "data_quality": list(data_quality),
         "kernel_names": names,
@@ -176,6 +184,18 @@ def render_markdown(b: dict) -> str:
                           ("other_idle_pct_of_idle", "other % of idle")]), ""]
 
     out += ["## 6. GPU kernel breakdown", "", DESCRIPTIONS["kernels"], ""]
+    if b["category_comparison"]:
+        out += [f"### Kernel time by category across runs (ms/step; Δ vs. {b['baseline']})", "",
+                tables.render(b["category_comparison"]), ""]
+    elif runs and runs[0]["metrics"]["categories"]:
+        r = runs[0]
+        out += ["### Kernel time by category", "",
+                tables.render([{"category": c, "ms/step": r["metrics"]["categories"][c],
+                                "% GPU time": r["metrics"]["category_pct"].get(c)}
+                               for c in CATEGORIES if c in r["metrics"]["categories"]]), ""]
+    if b["kernel_comparison"]:
+        out += [f"### Kernels shared by several runs (ms/step; Δ vs. {b['baseline']})", "",
+                tables.render(b["kernel_comparison"]), ""]
     kcols = ["short", "kernel_type", "ms_per_step", "pct_gpu", "calls_per_step", "mean_us",
              "precision"]
     kheads = {"short": "kernel", "kernel_type": "type", "ms_per_step": "ms/step",
@@ -187,9 +207,6 @@ def render_markdown(b: dict) -> str:
         if r["metrics"]["gemm_conv_precision_pct"]:
             out += [f"GEMM/conv time by precision: "
                     f"{_fmt(r['metrics']['gemm_conv_precision_pct'])} (%).", ""]
-    if b["kernel_comparison"]:
-        out += [f"### Kernel time across runs (ms/step; Δ vs. {b['baseline']})", "",
-                tables.render(b["kernel_comparison"]), ""]
 
     out += ["## 7. CUDA kernel launch stats", "", DESCRIPTIONS["launch"], "",
             metric_table([("kernels_per_step", "kernels/step"),

@@ -6,7 +6,7 @@ TOP_N = 15
 # Rule-based flag thresholds (spec §7a). Tuned on the generate-example-traces demo traces.
 GPU_IDLE_HIGH_PCT = 20.0          # GPU idle > this % of step time
 HOST_BOUND_PCT = 50.0             # host-wait > this % of idle time ...
-HOST_BOUND_MIN_IDLE_PCT = 5.0     # ... and the GPU is idle at least this much
+HOST_BOUND_MIN_IDLE_PCT = 10.0    # ... and the GPU is idle at least this much
 LAUNCH_BOUND_SHORT_KERNEL_US = 10.0
 LAUNCH_BOUND_SHORT_KERNEL_PCT = 50.0  # > this % of kernels shorter than the cutoff above
 LAUNCH_BOUND_MIN_IDLE_PCT = 10.0  # a busy GPU is not launch bound

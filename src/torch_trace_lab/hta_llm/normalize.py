@@ -8,8 +8,13 @@ from torch_trace_lab.hta_llm import settings
 from torch_trace_lab.hta_llm.analyses import RunAnalysis
 
 MEMCPY = re.compile(r"^Memcpy (HtoD|DtoH)")
-GEMM_CONV = re.compile(r"gemm|conv|fprop|dgrad|wgrad|cudnn|cutlass|xmma|winograd|implicit"
-                       r"|s1688|s16816|h1688|h16816|884", re.I)
+# Matrix-multiply and convolution kernels (cuBLAS, cuDNN, CUTLASS, Triton mm templates).
+# Not batch-norm or layout kernels that merely live in cuDNN, and not Triton pointwise or
+# reduction kernels whose fused-op names mention "convolution".
+GEMM_CONV = re.compile(r"gemm|xmma|fprop|dgrad|wgrad|winograd|implicit_convolve|cutlass"
+                       r"|s1688|s16816|h1688|h16816|^triton_tem_", re.I)
+NOT_GEMM_CONV = re.compile(r"^(void )?(cudnn::)?bn_|nchwToNhwc|nhwcToNchw|^triton_(poi|red|per)_",
+                           re.I)
 
 
 def kernel_precision(name: str) -> str | None:
@@ -17,24 +22,83 @@ def kernel_precision(name: str) -> str | None:
     n = name.lower()
     if "bf16" in n:
         return "bf16"
-    if re.search(r"fp16|f16|half|h1688|h16816|h884|884gemm", n):
+    if re.search(r"fp16|f16f16|_f16_|half|h1688|h16816|h884|884gemm", n):
         return "fp16"
     if re.search(r"tf32|s1688|s16816", n):
         return "tf32"
-    if re.search(r"sgemm|f32f32|fp32|scudnn|convolve_sgemm|float", n):
+    if re.search(r"sgemm|f32f32|fp32|scudnn|convolve_sgemm", n):
         return "fp32"
     return None
 
 
 def is_gemm_or_conv(name: str) -> bool:
-    return bool(GEMM_CONV.search(name))
+    return bool(GEMM_CONV.search(name)) and not NOT_GEMM_CONV.search(name)
+
+
+CATEGORIES = ("GEMM/conv", "fused (torch.compile)", "batch norm", "layout transpose",
+              "elementwise/reduction", "optimizer", "memcpy/memset", "other")
+
+
+def kernel_category(name: str) -> str:
+    """A coarse kernel category that lines up across eager and compiled runs."""
+    if re.match(r"Mem(cpy|set)", name):
+        return "memcpy/memset"
+    if is_gemm_or_conv(name):
+        return "GEMM/conv"
+    if name.startswith("triton_"):
+        return "fused (torch.compile)"
+    if re.search(r"nchwToNhwc|nhwcToNchw", name):
+        return "layout transpose"
+    if re.search(r"(^|::)bn_|batch_?norm", name, re.I):
+        return "batch norm"
+    if re.search(r"multi_tensor_apply|fused_adam|fused_sgd|_amp_", name, re.I):
+        return "optimizer"
+    if re.search(r"elementwise|reduce|reduction", name, re.I):
+        return "elementwise/reduction"
+    return "other"
+
+
+# Kernel names that say nothing without their template arguments.
+GENERIC_KERNELS = {"vectorized_elementwise_kernel", "unrolled_elementwise_kernel",
+                   "elementwise_kernel", "reduce_kernel", "Kernel", "Kernel2",
+                   "multi_tensor_apply_kernel", "index_elementwise_kernel"}
+TEMPLATE_STOPWORDS = {"float", "double", "half", "char", "bool", "void", "true", "false", "int",
+                      "long", "unsigned", "const", "std", "array", "native", "detail", "Array",
+                      "TensorIteratorBase", "lambda", "operator", "Scalar", "TensorListMetadata",
+                      "anonymous", "namespace", "BFloat16", "Half", "c10", "OffsetCalculator"}
+
+
+def _template_tag(args: str) -> str | None:
+    """The most telling identifier in a kernel's template arguments."""
+    words = [w for w in re.findall(r"[A-Za-z_]\w{3,}", args) if w not in TEMPLATE_STOPWORDS]
+    for pattern in (r"\w+_kernel_impl$|^launch_\w+|\w+_kernel_cuda$",
+                    r"Functor_\w+|\w+_\w*gemm\w*", r"Functor"):
+        for w in words:
+            if re.search(pattern, w):
+                return w.removesuffix("_kernel_impl").removesuffix("_kernel_cuda")
+    return words[0] if words else None
 
 
 def shorten(name: str, limit: int = 60) -> str:
-    """A readable short kernel name: no template arguments, parameters, or namespaces."""
+    """A readable short kernel name: no template arguments, parameters, or namespaces.
+
+    Generic kernels (``vectorized_elementwise_kernel``, CUTLASS ``Kernel2``, ...) keep their
+    most telling template argument, e.g. ``vectorized_elementwise_kernel<CUDAFunctor_add>``.
+    """
     s = name.strip()
     if s.startswith("void "):
         s = s[5:]
+    s = re.sub(r"\(anonymous namespace\)::", "", s)
+    first_template = s.find("<")
+    template_args = ""
+    if first_template != -1:
+        depth, end = 0, len(s)
+        for i in range(first_template, len(s)):
+            depth += {"<": 1, ">": -1}.get(s[i], 0)
+            if depth == 0:
+                end = i
+                break
+        template_args = s[first_template + 1:end]
     # Drop template arguments, innermost first.
     prev = None
     while prev != s:
@@ -42,9 +106,10 @@ def shorten(name: str, limit: int = 60) -> str:
         s = re.sub(r"<[^<>]*>", "", s)
     s = re.sub(r"\(.*\)$", "", s)  # parameter list
     s = re.sub(r"\b(at::native::|at::|c10::|cudnn::|cutlass::|std::)", "", s)
-    s = re.sub(r"\(anonymous namespace\)::", "", s)
     s = s.split("/")[-1]  # path-like names keep only the basename
     s = re.sub(r"\s+", " ", s).strip()
+    if s in GENERIC_KERNELS and (tag := _template_tag(template_args)):
+        s = f"{s}<{tag}>"
     if len(s) > limit:
         s = s[: limit - 1] + "…"
     return s or name[:limit]
@@ -109,6 +174,8 @@ class RunMetrics:
     top_kernel: str | None = None
     memcpy_pct: float | None = None
     gemm_conv_precision_pct: dict[str, float] = field(default_factory=dict)
+    categories: dict[str, float] = field(default_factory=dict)    # ms/step per kernel category
+    category_pct: dict[str, float] = field(default_factory=dict)  # % of GPU kernel time
     kernels_per_step: float | None = None
     median_kernel_us: float | None = None
     median_launch_cpu_us: float | None = None
@@ -175,7 +242,12 @@ def normalize_run(label: str, a: RunAnalysis, *, top_n: int = settings.TOP_N,
                 p = kernel_precision(row["name"]) or "unknown"
                 by_prec[p] = by_prec.get(p, 0.0) + float(row["sum_us"])
             m.gemm_conv_precision_pct = {p: r1(100 * v / gc_total)
-                                         for p, v in sorted(by_prec.items())}
+                                         for p, v in sorted(by_prec.items())
+                                         if r1(100 * v / gc_total)}
+        by_cat = k.groupby(k["name"].map(kernel_category))["sum_us"].sum()
+        m.categories = {c: r2(by_cat[c] / div / 1000) for c in CATEGORIES if c in by_cat.index}
+        m.category_pct = {c: r1(100 * by_cat[c] / total) for c in CATEGORIES
+                          if c in by_cat.index and total}
 
     if a.launch is not None and not a.launch.empty:
         l = a.launch
@@ -192,28 +264,51 @@ def normalize_run(label: str, a: RunAnalysis, *, top_n: int = settings.TOP_N,
 
 
 def kernel_comparison(runs: list[RunMetrics], baseline: int = 0) -> list[dict]:
-    """Join per-run kernel tables on short name, with deltas vs. the baseline run (ms/step)."""
+    """Join per-run top-N kernel tables on short name, with ms/step deltas vs. the baseline.
+
+    Only kernels in the top-N of at least two runs are joined: torch.compile replaces most
+    eager kernels, so kernels unique to one run add rows without explaining differences.
+    The category comparison covers those.
+    """
     order: list[str] = []
     for r in runs:
         for k in r.kernels:
             if k.short != "other" and k.short not in order:
                 order.append(k.short)
-    order.append("other")
     base = runs[baseline]
     rows = []
     for short in order:
         values = {r.label: next((k.ms_per_step for k in r.kernels if k.short == short), None)
                   for r in runs}
-        if all(v is None for v in values.values()):
+        if sum(v is not None for v in values.values()) < 2:
             continue
         b = values[base.label] or 0.0
         row = {"kernel": short, **values}
         for r in runs:
-            if r is base:
-                continue
-            v = values[r.label] or 0.0
-            row[f"Δ {r.label}"] = r2(v - b)
-            row[f"Δ% {r.label}"] = r1(100 * (v - b) / b) if b else None
+            if r is not base:
+                row[f"Δ {r.label}"] = r2((values[r.label] or 0.0) - b)
+        rows.append(row)
+    return rows
+
+
+def category_comparison(runs: list[RunMetrics], baseline: int = 0) -> list[dict]:
+    """GPU kernel time per category (ms/step) across runs, with deltas vs. the baseline."""
+    base = runs[baseline]
+    rows = []
+    for cat in [*CATEGORIES, "total"]:
+        if cat == "total":
+            values = {r.label: r.kernel_ms_per_step for r in runs}
+        else:
+            values = {r.label: r.categories.get(cat) for r in runs}
+        if all(not v for v in values.values()):
+            continue
+        b = values[base.label] or 0.0
+        row = {"category": cat, **values}
+        for r in runs:
+            if r is not base:
+                v = values[r.label] or 0.0
+                row[f"Δ {r.label}"] = r2(v - b)
+                row[f"Δ% {r.label}"] = r1(100 * (v - b) / b) if b else None
         rows.append(row)
     return rows
 
