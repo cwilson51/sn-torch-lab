@@ -137,10 +137,10 @@ There is no built-in default URL. For safety, the URL must use https to an allow
 
 **What is sent to Brine.** Only aggregated tables (per-step times, top kernels, idle breakdown, flags) and allowlisted run facts (GPU model, precision, batch size, ...). Raw traces, file paths, usernames, hostnames, job IDs and Slurm data are never sent. Before every call a leak check scans the prompt for your username, home directory, cluster paths, hostname, Slurm values and account names, and blocks the call if it finds any. **`--run-note` text and run directory names are sent as written, so keep sensitive information out of them.** Check `prompt.md` to see exactly what was sent.
 
-**Where to run it.** On your own machine, or inside a job on an Alliance cluster. A GPU is not needed. On a login node the command refuses to run, because loading the traces needs several GB of memory. Start an interactive job instead:
+**Where to run it.** On your own machine, or inside a job on an Alliance cluster. A GPU is not needed. On a login node the command refuses to run, because loading the traces needs several GB of memory (the five demo traces peaked at about 5 GB). Start an interactive job instead:
 
 ```
-salloc --time=0:30:0 --cpus-per-task=4 --mem=16G --account=def-someuser
+salloc --time=0:30:0 --cpus-per-task=4 --mem=8G --account=def-someuser
 torch-lab analyze-traces ./traces
 ```
 

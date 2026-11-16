@@ -32,5 +32,6 @@ REQUEST_TIMEOUT_S = 300
 RETRIES = 3
 RETRY_BACKOFF_S = 2.0
 
-# Suggested memory for `salloc` when analyzing the four demo traces (measured, see README).
-SUGGESTED_MEM = "16G"
+# Suggested memory for `salloc`. Measured: 5.1 GB peak (seff) for a job that generated the five
+# demo traces on an H100 MIG 1g.10gb slice and analyzed them; 8G leaves headroom.
+SUGGESTED_MEM = "8G"
