@@ -9,13 +9,6 @@ from torch_trace_lab import cli, example_traces as et
 CMD = "generate-example-traces"
 
 
-@pytest.fixture(autouse=True)
-def clean_env(monkeypatch):
-    for var in ["CC_CLUSTER", "SLURM_JOB_ID", "SLURM_ACCOUNT", "SBATCH_ACCOUNT",
-                "SLURM_CPUS_PER_TASK"]:
-        monkeypatch.delenv(var, raising=False)
-
-
 @pytest.fixture
 def calls(monkeypatch):
     record = SimpleNamespace(run_traces=0, subprocess=[])
@@ -184,3 +177,11 @@ def test_invalid_batch_size(value, capsys):
     with pytest.raises(SystemExit) as exc:
         cli.main([CMD, "--batch-size", value])
     assert exc.value.code == 2
+
+
+def test_each_config_writes_its_own_run_directory(tmp_path):
+    runs = et.trace_runs(64, tmp_path)
+    dirs = [args[args.index("--output_dir") + 1] for _, args in runs]
+    assert dirs == [str(tmp_path / sub) for sub in
+                    ["main-process", "serial", "threaded", "threaded-compiled",
+                     "threaded-compiled-amp"]]

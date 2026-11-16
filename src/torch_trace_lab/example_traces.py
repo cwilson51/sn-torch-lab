@@ -14,35 +14,35 @@ import sys
 from importlib.resources import files
 from pathlib import Path
 
+from torch_trace_lab.cluster import in_slurm_job, on_alliance_cluster, threaded_workers
+
 TEMPLATE = "templates/generate_example_traces.sh"
 PROFILE_ARGS = ["--skip_first", "10", "--warmup", "10", "--active", "10"]
 
 
-def on_alliance_cluster() -> bool:
-    """Every Alliance (Compute Canada) cluster sets CC_CLUSTER."""
-    return bool(os.environ.get("CC_CLUSTER"))
-
-
-def in_slurm_job() -> bool:
-    return bool(os.environ.get("SLURM_JOB_ID"))
-
-
-def threaded_workers() -> int:
-    cpus = os.environ.get("SLURM_CPUS_PER_TASK")
-    if cpus:
-        return int(cpus)
-    return min(os.cpu_count() or 1, 4)
+# Each config writes to its own run directory, the layout `torch-lab analyze-traces` expects.
+RUN_SUBDIRS = {
+    "Main process": "main-process",
+    "Serial": "serial",
+    "Threaded": "threaded",
+    "Threaded, compiled": "threaded-compiled",
+    "Threaded, compiled, AMP": "threaded-compiled-amp",
+}
 
 
 def trace_runs(batch_size: int, output_dir: Path) -> list[tuple[str, list[str]]]:
     n = str(threaded_workers())
-    base = [str(batch_size), "--output_dir", str(output_dir), *PROFILE_ARGS]
+    configs = [
+        ("Main process", ["--nWorkers", "0"]),  # PyTorch default: no worker processes
+        ("Serial", ["--nWorkers", "1"]),
+        ("Threaded", ["--nWorkers", n]),
+        ("Threaded, compiled", ["--nWorkers", n, "--compile"]),
+        ("Threaded, compiled, AMP", ["--nWorkers", n, "--compile", "--amp"]),
+    ]
     return [
-        ("Main process", [*base, "--nWorkers", "0"]),  # PyTorch default: no worker processes
-        ("Serial", [*base, "--nWorkers", "1"]),
-        ("Threaded", [*base, "--nWorkers", n]),
-        ("Threaded, compiled", [*base, "--nWorkers", n, "--compile"]),
-        ("Threaded, compiled, AMP", [*base, "--nWorkers", n, "--compile", "--amp"]),
+        (name, [str(batch_size), "--output_dir", str(output_dir / RUN_SUBDIRS[name]),
+                *PROFILE_ARGS, *extra])
+        for name, extra in configs
     ]
 
 

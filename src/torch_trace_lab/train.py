@@ -9,6 +9,7 @@ DataLoader opens, reads, decodes and augments each one, as it would with ImageNe
 """
 
 import argparse
+import json
 import os
 import time
 import warnings
@@ -52,6 +53,51 @@ def parse_args(argv=None):
     parser.add_argument("--active", type=int, default=1,
                         help="Number of steps to record.")
     return parser.parse_args(argv)
+
+
+MODEL_NAME = "ResNet-50 (synthetic ImageNet-like JPEGs)"
+
+
+def torch_lab_metadata(args, device_type: str) -> dict:
+    """The run config that ``torch-lab analyze-traces`` reads from the trace's ``torch_lab`` key."""
+    if args.amp:
+        precision = "fp16-amp" if device_type == "cuda" else "bf16-amp"
+    elif args.compile and device_type == "cuda":
+        precision = "tf32"  # --compile sets float32 matmul precision to "high"
+    elif device_type == "cuda":
+        # Matmuls stay fp32, but cuDNN convolutions use TF32 by default
+        # (torch.backends.cudnn.allow_tf32 is True).
+        precision = "fp32 (TF32 convs)"
+    else:
+        precision = "fp32"
+    return {
+        "model": MODEL_NAME,
+        "batch_size_per_gpu": args.batch_size,
+        "dataloader_workers": args.nWorkers,
+        "torch_compile": bool(args.compile),
+        "precision": precision,
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "profiler_schedule": {
+            "skip_first": args.skip_first,
+            "wait": 0,
+            "warmup": args.warmup,
+            "active": args.active,
+        },
+    }
+
+
+def embed_metadata(trace_path: Path, metadata: dict) -> None:
+    """Add ``metadata`` as a top-level ``torch_lab`` object in an exported trace.
+
+    ``prof.add_metadata_json`` drops metadata added outside the active window of a
+    profiler schedule, so the JSON is rewritten after export instead.
+    """
+    with open(trace_path) as f:
+        trace = json.load(f)
+    trace["torch_lab"] = metadata
+    with open(trace_path, "w") as f:
+        json.dump(trace, f)
 
 
 def main(argv=None):
@@ -187,6 +233,7 @@ def main(argv=None):
         f"{job_id}_train_batch_{args.batch_size}_nworkers_{args.nWorkers}{compiled}{amp}_trace.json"
     )
     prof.export_chrome_trace(str(trace_path))
+    embed_metadata(trace_path, torch_lab_metadata(args, device.type))
     print(f"Trace written to {trace_path}")
 
 

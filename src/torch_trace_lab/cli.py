@@ -7,9 +7,9 @@ which registers the subcommand and sets ``func`` to the function that runs it.
 import argparse
 import sys
 
-from torch_trace_lab import example_traces
+from torch_trace_lab import analyze_traces, example_traces
 
-SUBCOMMANDS = [example_traces]
+SUBCOMMANDS = [example_traces, analyze_traces]
 
 
 def build_parser() -> argparse.ArgumentParser:
