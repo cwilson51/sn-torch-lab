@@ -198,6 +198,10 @@ def cluster_name() -> str | None:
 DIFF_FACTS = ("gpu", "compute_capability", "gpu_memory_gb", "world_size")
 
 
+def _low_confidence(entry: dict) -> bool:
+    return entry.get("source") == "inferred" and entry.get("confidence") == "low"
+
+
 def config_diff(contexts: list[RunContext]) -> tuple[list[dict], bool]:
     """Fields whose values differ across runs. Returns (rows, distinguishable).
 
@@ -209,10 +213,15 @@ def config_diff(contexts: list[RunContext]) -> tuple[list[dict], bool]:
     for c in contexts:
         config_keys += [k for k in c.config if k not in config_keys]
     for key in config_keys:
-        values = {c.label: c.config[key]["value"] if key in c.config else "unknown"
-                  for c in contexts}
-        if len({repr(v) for v in values.values()}) > 1:
-            sources = {c.label: c.config[key]["source"] if key in c.config else "unknown"
+        # Low-confidence inferred values never create a diff row on their own: they are
+        # left out of the comparison and shown as unknown if the field differs anyway.
+        low = {c.label for c in contexts if key in c.config and _low_confidence(c.config[key])}
+        values = {c.label: c.config[key]["value"] if key in c.config and c.label not in low
+                  else "unknown" for c in contexts}
+        compared = {repr(v) for label, v in values.items() if label not in low}
+        if len(compared) > 1:
+            sources = {c.label: c.config[key]["source"]
+                       if key in c.config and c.label not in low else "unknown"
                        for c in contexts}
             known = {s for s in sources.values() if s != "unknown"}
             rows.append({"field": key, "source": known.pop() if len(known) == 1 else "mixed",

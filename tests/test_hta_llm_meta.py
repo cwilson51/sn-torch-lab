@@ -116,3 +116,33 @@ def test_inferred_fills_gaps_and_agreement_is_not_a_conflict():
 ])
 def test_same_value(key, a, b, same):
     assert same_value(key, a, b) is same
+
+
+def _ctx(label, **config):
+    from torch_trace_lab.hta_llm.context import RunContext
+    return RunContext(label, config={k: dict(v) for k, v in config.items()})
+
+
+LOW = {"source": "inferred", "confidence": "low", "evidence": "x"}
+MEDIUM = {"source": "inferred", "confidence": "medium", "evidence": "x"}
+
+
+def test_low_confidence_values_do_not_create_diff_rows():
+    from torch_trace_lab.hta_llm.context import config_diff
+    rows, distinguishable = config_diff([
+        _ctx("a", memory_format={**MEDIUM, "value": "contiguous (NCHW)"}),
+        _ctx("b", memory_format={**MEDIUM, "value": "contiguous (NCHW)"}),
+        _ctx("c", memory_format={**LOW, "value": "channels_last"}),
+    ])
+    assert rows == [] and distinguishable is False
+
+
+def test_low_confidence_values_show_as_unknown_when_field_differs():
+    from torch_trace_lab.hta_llm.context import config_diff
+    rows, _ = config_diff([
+        _ctx("a", precision={**MEDIUM, "value": "fp32"}),
+        _ctx("b", precision={"source": "embedded", "value": "bf16-amp"}),
+        _ctx("c", precision={**LOW, "value": "fp16"}),
+    ])
+    assert rows[0]["values"] == {"a": "fp32", "b": "bf16-amp", "c": "unknown"}
+    assert rows[0]["sources"]["c"] == "unknown" and rows[0]["source"] == "mixed"
