@@ -34,14 +34,27 @@ def threaded_workers() -> int:
     return min(os.cpu_count() or 1, 4)
 
 
+# Each config writes to its own run directory, the layout `torch-lab analyze-traces` expects.
+RUN_SUBDIRS = {
+    "Serial": "serial",
+    "Threaded": "threaded",
+    "Threaded, compiled": "threaded-compiled",
+    "Threaded, compiled, AMP": "threaded-compiled-amp",
+}
+
+
 def trace_runs(batch_size: int, output_dir: Path) -> list[tuple[str, list[str]]]:
     n = str(threaded_workers())
-    base = [str(batch_size), "--output_dir", str(output_dir), *PROFILE_ARGS]
+    configs = [
+        ("Serial", ["--nWorkers", "1"]),
+        ("Threaded", ["--nWorkers", n]),
+        ("Threaded, compiled", ["--nWorkers", n, "--compile"]),
+        ("Threaded, compiled, AMP", ["--nWorkers", n, "--compile", "--amp"]),
+    ]
     return [
-        ("Serial", [*base, "--nWorkers", "1"]),
-        ("Threaded", [*base, "--nWorkers", n]),
-        ("Threaded, compiled", [*base, "--nWorkers", n, "--compile"]),
-        ("Threaded, compiled, AMP", [*base, "--nWorkers", n, "--compile", "--amp"]),
+        (name, [str(batch_size), "--output_dir", str(output_dir / RUN_SUBDIRS[name]),
+                *PROFILE_ARGS, *extra])
+        for name, extra in configs
     ]
 
 
