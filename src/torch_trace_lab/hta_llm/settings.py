@@ -27,6 +27,10 @@ INFER_TRANSPOSE_PCT = 5.0         # NCHW<->NHWC transposes >= this % of GEMM/con
 # Prompt size. Brine chat models allow 131,072 tokens in + out.
 CONTEXT_TOKENS = 131_072
 MAX_PROMPT_TOKENS = 24_000
+# Over budget, shrink the prompt in this order (spec §7.9): smaller kernel tables, then drop
+# optional bundle sections one by one; only then warn and send it anyway.
+BUDGET_TOP_N_STEPS = (10, 5)
+OPTIONAL_SECTIONS = ("launch stats", "category comparison", "kernel-name appendix")
 CHARS_PER_TOKEN = 2.5  # conservative: markdown tables and kernel names tokenize densely
                        # (a measured bundle prompt ran ~2.6 chars/token on Brine)
 

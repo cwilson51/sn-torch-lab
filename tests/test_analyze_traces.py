@@ -318,3 +318,67 @@ def test_meta_notes_with_path_block_brine(leaky_env, tmp_path, monkeypatch, fake
     assert run(leaky_env, "--meta", meta, "--output-dir", out) == 1
     assert fake_brine.calls == []
     assert "leak check" in (out / "report.md").read_text()
+
+
+def test_budget_plan_shrinks_in_order():
+    from torch_trace_lab.hta_llm import pipeline
+    assert pipeline.budget_plan(15) == [
+        (15, ()), (10, ()), (5, ()),
+        (5, ("launch stats",)),
+        (5, ("launch stats", "category comparison")),
+        (5, ("launch stats", "category comparison", "kernel-name appendix")),
+    ]
+    assert pipeline.budget_plan(3)[0] == (3, ())
+    assert all(n == 3 for n, _ in pipeline.budget_plan(3))
+
+
+def many_kernel_runs(tmp_path):
+    parent = tmp_path / "runs"
+    kernels = [(f"void some_namespace::kernel_number_{i}<float, 128, true>", 50 + i)
+               for i in range(16)]
+    for name in ["a", "b"]:
+        write_trace(parent / name / "t.json", steps=2, kernels=kernels)
+    return parent
+
+
+def test_budget_cascade_reduces_top_n_first(monkeypatch, tmp_path):
+    from torch_trace_lab.hta_llm import pipeline, settings
+    parent = many_kernel_runs(tmp_path)
+    collected = pipeline.collect(pipeline.Options([parent], tmp_path / "o"), pipeline.Log())
+    sizes = {}
+    for n, drop in pipeline.budget_plan(15):
+        b, md = pipeline.assemble(collected, n, drop, top_n_requested=15)
+        sizes[(n, drop)] = pipeline.estimate_tokens(*pipeline.build_prompt(b, md))
+    # Budget between the top-10 and top-15 sizes: only top-n shrinks.
+    monkeypatch.setattr(settings, "MAX_PROMPT_TOKENS", sizes[(10, ())])
+    out = tmp_path / "out"
+    assert run(parent, "--no-llm", "--output-dir", out) == 0
+    b = json.loads((out / "bundle.json").read_text())
+    assert b["budget"]["top_n_used"] == 10 and b["budget"]["dropped_sections"] == []
+    assert len(b["runs"][0]["kernels"]) == 11  # top 10 + remaining
+    assert "To fit the prompt budget, kernel tables show the top 10 kernels instead of 15" \
+        in (out / "bundle.md").read_text()
+
+
+def test_budget_cascade_drops_sections_then_warns(monkeypatch, tmp_path, capsys):
+    from torch_trace_lab.hta_llm import settings
+    parent = many_kernel_runs(tmp_path)
+    monkeypatch.setattr(settings, "MAX_PROMPT_TOKENS", 10)
+    out = tmp_path / "out"
+    assert run(parent, "--no-llm", "--output-dir", out) == 0
+    b = json.loads((out / "bundle.json").read_text())
+    assert b["budget"]["top_n_used"] == 5
+    assert b["budget"]["dropped_sections"] == list(settings.OPTIONAL_SECTIONS)
+    assert b["category_comparison"] == [] and b["kernel_names"] == {}
+    md = (out / "bundle.md").read_text()
+    assert "CUDA kernel launch stats" not in md and "Appendix" not in md
+    assert "still larger than" in capsys.readouterr().err
+
+
+def test_within_budget_bundle_is_unchanged(two_runs, tmp_path):
+    out = tmp_path / "out"
+    assert run(two_runs, "--no-llm", "--output-dir", out) == 0
+    b = json.loads((out / "bundle.json").read_text())
+    assert b["budget"]["dropped_sections"] == [] and b["budget"]["top_n_used"] == 15
+    assert b["budget"]["estimated_tokens"] < b["budget"]["max_prompt_tokens"]
+    assert "To fit the prompt budget" not in (out / "bundle.md").read_text()

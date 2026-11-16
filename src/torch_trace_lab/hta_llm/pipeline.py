@@ -69,8 +69,18 @@ def prompt_markdown(system: str, user: str) -> str:
     return f"# System prompt\n\n{system.strip()}\n\n# User prompt\n\n{user.strip()}\n"
 
 
-def analyze(opts: Options, log: Log) -> tuple[dict, str]:
-    """Stages 1-4. Returns (bundle dict, bundle markdown). Raises IngestError / ValueError."""
+@dataclass
+class Collected:
+    """Everything the expensive stages produce; assemble() can rebuild the bundle from it."""
+    scenario: str
+    baseline: int
+    contexts: list[context.RunContext]
+    results: list[analyses.RunAnalysis]   # plain DataFrames; independent of the staging dir
+    warnings: list[str]
+
+
+def collect(opts: Options, log: Log) -> Collected:
+    """Stages 1-2 plus run context. Raises IngestError / ValueError."""
     with tempfile.TemporaryDirectory(prefix="torch-lab-hta-") as stage:
         runs, warnings = ingest.ingest(opts.paths, Path(stage))
         labels = [r.label for r in runs]
@@ -93,50 +103,98 @@ def analyze(opts: Options, log: Log) -> tuple[dict, str]:
         scenario = "S1" if len(runs) == 1 else "S2"
         log.info(f"Scenario {scenario}: {len(runs)} run(s): {', '.join(labels)}")
 
-        names: dict[str, str] = {}
-        metrics, flags = [], {}
-        for run, ctx in zip(runs, contexts):
+        results = []
+        for run in runs:
             start = time.monotonic()
             log.info(f"Analyzing {run.label} ...")
             result = analyses.run_all(run.staged_dir)
             for name, reason in result.unavailable.items():
                 log.warn(f"{run.label}: {name} analysis unavailable: {reason}")
-            m = normalize.normalize_run(run.label, result, top_n=opts.top_n, names=names,
-                                        batch_size=ctx.batch_size)
-            metrics.append(m)
-            flags[run.label] = heuristics.flags_for(m, ctx.compute_capability)
-            log.info(f"  {run.label}: {m.steps or 'no'} steps, "
-                     f"flags: {', '.join(f.id for f in flags[run.label]) or 'none'} "
-                     f"({time.monotonic() - start:.1f} s)")
+            results.append(result)
+            log.info(f"  {run.label}: done ({time.monotonic() - start:.1f} s)")
+    return Collected(scenario, baseline, contexts, results, warnings)
 
-    diff, distinguishable = context.config_diff(contexts)
-    b = bundle.build(scenario=scenario, metrics=metrics, contexts=contexts, flags=flags,
-                     baseline=baseline, config_diff=diff, distinguishable=distinguishable,
-                     data_quality=warnings, cluster=context.cluster_name(), kernel_names=names)
+
+def assemble(c: Collected, top_n: int, drop: tuple[str, ...] = (),
+             top_n_requested: int | None = None) -> tuple[dict, str]:
+    """Stages 3-4: normalize, flag, bundle. Cheap, so the budget cascade can repeat it."""
+    names: dict[str, str] = {}
+    metrics, flags = [], {}
+    for ctx, result in zip(c.contexts, c.results):
+        m = normalize.normalize_run(ctx.label, result, top_n=top_n, names=names,
+                                    batch_size=ctx.batch_size)
+        metrics.append(m)
+        flags[ctx.label] = heuristics.flags_for(m, ctx.compute_capability)
+    diff, distinguishable = context.config_diff(c.contexts)
+    budget = {"top_n_requested": top_n_requested or top_n, "top_n_used": top_n,
+              "dropped_sections": list(drop)}
+    b = bundle.build(scenario=c.scenario, metrics=metrics, contexts=c.contexts, flags=flags,
+                     baseline=c.baseline, config_diff=diff, distinguishable=distinguishable,
+                     data_quality=c.warnings, cluster=context.cluster_name(), kernel_names=names,
+                     budget=budget)
     return b, bundle.render_markdown(b)
+
+
+def analyze(opts: Options, log: Log) -> tuple[dict, str]:
+    """Stages 1-4 at the requested size. Raises IngestError / ValueError."""
+    return assemble(collect(opts, log), opts.top_n)
+
+
+def budget_plan(top_n: int) -> list[tuple[int, tuple[str, ...]]]:
+    """Sizes to try, in order: as requested, smaller top-N, then fewer optional sections."""
+    plan = [(top_n, ())]
+    plan += [(n, ()) for n in settings.BUDGET_TOP_N_STEPS if n < top_n]
+    smallest = plan[-1][0]
+    sections = settings.OPTIONAL_SECTIONS
+    plan += [(smallest, sections[:i + 1]) for i in range(len(sections))]
+    return plan
+
+
+def estimate_tokens(system: str, user: str) -> int:
+    return int(len(system + user) / settings.CHARS_PER_TOKEN)
+
+
+def fit_budget(c: Collected, top_n: int, log: Log) -> tuple[dict, str, str, str, int]:
+    """Assemble the bundle and prompt, shrinking them until the prompt fits (spec §7.9)."""
+    for i, (n, drop) in enumerate(budget_plan(top_n)):
+        b, bundle_md = assemble(c, n, drop, top_n_requested=top_n)
+        system, user = build_prompt(b, bundle_md)
+        tokens = estimate_tokens(system, user)
+        if tokens <= settings.MAX_PROMPT_TOKENS:
+            break
+        log.info(f"Prompt: about {tokens:,} tokens with top-n {n}"
+                 + (f" and without {', '.join(drop)}" if drop else "")
+                 + f"; over the {settings.MAX_PROMPT_TOKENS:,}-token budget, shrinking ...")
+    else:
+        log.warn(f"The prompt is still larger than {settings.MAX_PROMPT_TOKENS:,} tokens after "
+                 "every reduction; sending it anyway. Try fewer runs.")
+    if b["budget"]["top_n_used"] != top_n or b["budget"]["dropped_sections"]:
+        log.warn("To fit the prompt budget: " + bundle.budget_note(b["budget"]))
+    b["budget"]["estimated_tokens"] = tokens
+    b["budget"]["max_prompt_tokens"] = settings.MAX_PROMPT_TOKENS
+    return b, bundle_md, system, user, tokens
 
 
 def run(opts: Options, log: Log | None = None) -> int:
     log = log or Log()
     out = opts.output_dir
     try:
-        b, bundle_md = analyze(opts, log)
+        collected = collect(opts, log)
     except (ingest.IngestError, ValueError) as e:
         log.error(str(e))
         return 1
 
+    b, bundle_md, system, user, tokens = fit_budget(collected, opts.top_n, log)
+    for r in b["runs"]:
+        log.info(f"  {r['label']}: {r['metrics']['steps'] or 'no'} steps, flags: "
+                 f"{', '.join(f['id'] for f in r['flags']) or 'none'}")
     out.mkdir(parents=True, exist_ok=True)
-    system, user = build_prompt(b, bundle_md)
     prompt_md = prompt_markdown(system, user)
     (out / "bundle.json").write_text(json.dumps(b, indent=2) + "\n")
     (out / "bundle.md").write_text(bundle_md)
     (out / "prompt.md").write_text(prompt_md)
 
-    tokens = int(len(system + user) / settings.CHARS_PER_TOKEN)
     log.info(f"Prompt: about {tokens:,} tokens (estimate).")
-    if tokens > settings.MAX_PROMPT_TOKENS:
-        log.warn(f"The prompt is larger than {settings.MAX_PROMPT_TOKENS:,} tokens; "
-                 "consider a smaller --top-n.")
 
     def finish(code: int, reason: str | None = None, text: str | None = None) -> int:
         (out / "report.md").write_text(text if text is not None else report.flags_only(b, reason))
