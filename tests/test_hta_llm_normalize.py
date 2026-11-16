@@ -28,7 +28,7 @@ def test_shorten():
     assert len(normalize.shorten("k" * 200)) == 60
 
 
-# Real kernel names from the demo traces (H100, torch 2.14).
+# Real kernel names from PyTorch traces (cuDNN, CUTLASS, ATen, Triton; H100, torch 2.14).
 THRESHOLD = ("void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, "
              "float, float, at::native::(anonymous namespace)::threshold_kernel_impl<float>("
              "at::TensorIteratorBase&, float, float)::{lambda(float, float)#1}>, "

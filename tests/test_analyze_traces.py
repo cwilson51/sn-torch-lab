@@ -159,7 +159,7 @@ def test_unreachable_brine_writes_outputs_and_exits_1(monkeypatch, two_runs, tmp
 def test_cpu_only_trace_fails(tmp_path, capsys):
     write_trace(tmp_path / "r" / "t.json", gpu=False)
     assert run(tmp_path / "r", "--no-llm", "--output-dir", tmp_path / "out") == 1
-    assert "falls back to CPU" in capsys.readouterr().err
+    assert "contain only CPU events" in capsys.readouterr().err
 
 
 def test_no_metadata_says_not_distinguishable(tmp_path):

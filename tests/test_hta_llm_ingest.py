@@ -98,7 +98,7 @@ def test_incomplete_single_file_warns(tmp_path):
 
 def test_cpu_only_trace_fails_with_hint(tmp_path):
     f = write_trace(tmp_path / "r" / "t.json", gpu=False)
-    with pytest.raises(IngestError, match="falls back to CPU"):
+    with pytest.raises(IngestError, match="contain only CPU events"):
         run_ingest(tmp_path, f)
 
 

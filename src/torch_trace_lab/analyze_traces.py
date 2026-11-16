@@ -19,7 +19,6 @@ trace layout (file names don't matter):
   compare runs:  torch-lab analyze-traces experiments/     (each subdirectory is a run)
                  torch-lab analyze-traces runA/ runB/ ...
   Each run directory holds the trace file(s) of one run, one file per rank.
-  The output of `torch-lab generate-example-traces` already follows this layout.
 
 Only aggregated tables are sent to SHARCNET Brine, never raw traces. Keep sensitive
 information (paths, usernames, job IDs, account names) out of --run-note text and

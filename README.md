@@ -49,7 +49,7 @@ traces/
   threaded-compiled/   threaded-compiled-amp/
 ```
 
-Each trace also records its run configuration (batch size, DataLoader workers, `torch.compile`, precision) in a top-level `torch_lab` object, which `torch-lab analyze-traces` reads. What happens depends on where you run it:
+Each trace also records its run configuration (batch size, DataLoader workers, `torch.compile`, precision) in a top-level `torch_lab` object. This layout and metadata are what `torch-lab analyze-traces` expects of any traces, so `torch-lab analyze-traces ./traces` compares the example configurations directly. What happens depends on where you run it:
 
 - **Your own machine:** the runs execute locally. Without a CUDA GPU they fall back to CPU-only profiling.
 - **An Alliance cluster, inside a job** (e.g. after `salloc --gpus=1 ...`): the runs execute directly on the allocated node.
@@ -107,7 +107,7 @@ my-run/                                  experiments/
                                            bs128-amp/trace.json
 ```
 
-You can also pass a single trace file, or two or more run directories (`torch-lab analyze-traces runA/ runB/`). Each run directory holds one run. The output of `generate-example-traces` already follows this layout, so `torch-lab analyze-traces ./traces` compares its five configurations. The traces must be recorded on a CUDA GPU: traces from a CPU-only machine (including any Mac) have no GPU kernels to analyze.
+You can also pass a single trace file, or two or more run directories (`torch-lab analyze-traces runA/ runB/`). Each run directory holds one run. The traces must be recorded on a CUDA GPU: traces from a CPU-only machine (including any Mac) have no GPU kernels to analyze.
 
 **Outputs** (in `./hta-report`, change with `--output-dir`):
 
@@ -138,7 +138,7 @@ There is no built-in default URL. For safety, the URL must use https to an allow
 
 **What is sent to Brine.** Only aggregated tables (per-step times, top kernels, idle breakdown, flags) and allowlisted run facts (GPU model, precision, batch size, ...). Raw traces, file paths, usernames, hostnames, job IDs and Slurm data are never sent. Before every call a leak check scans the prompt for your username, home directory, cluster paths, hostname, Slurm values and account names, and blocks the call if it finds any. **`--run-note` text and run directory names are sent as written, so keep sensitive information out of them.** Check `prompt.md` to see exactly what was sent.
 
-**Where to run it.** On your own machine, or inside a job on an Alliance cluster. A GPU is not needed. On a login node the command refuses to run, because loading the traces needs several GB of memory (the five demo traces peaked at about 5 GB). Start an interactive job instead:
+**Where to run it.** On your own machine, or inside a job on an Alliance cluster. A GPU is not needed. On a login node the command refuses to run, because loading the traces needs several GB of memory. Memory grows with the total size of the traces: a few traces of 35–75 MB each peak at about 5 GB, so `--mem=8G` suits typical single-GPU runs; request more for larger or more traces. Start an interactive job instead:
 
 ```
 salloc --time=0:30:0 --cpus-per-task=4 --mem=8G --account=def-someuser

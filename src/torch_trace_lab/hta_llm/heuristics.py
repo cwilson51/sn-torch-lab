@@ -25,8 +25,8 @@ MEANINGS = {
     "GPU_IDLE_HIGH": "The GPU sits idle for a large share of the run, with no kernel executing. "
                      "Check HOST_BOUND or LAUNCH_BOUND for the reason.",
     "HOST_BOUND": "When the GPU is idle, it is mostly waiting for the CPU, usually for data "
-                  "loading or Python overhead between steps. Common once compile and AMP make "
-                  "the GPU fast enough that the data loader can't keep up.",
+                  "loading or Python overhead between steps. The faster the GPU work, the more "
+                  "easily the CPU side becomes the limit.",
     "LAUNCH_BOUND": "Kernels are so short that launching them from the CPU takes about as long as "
                     "running them, so the GPU waits between launches.",
     "TOP_KERNEL_DOMINANT": "A single kernel takes most of the GPU time. Often expected (a large "

@@ -173,8 +173,8 @@ def check_content(label: str, traces: list[TraceInfo]) -> list[str]:
         if not t.has_gpu_kernels:
             raise IngestError(
                 f"{label}: {t.path.name} has no GPU kernel events. The analysis needs a trace "
-                "recorded on a CUDA GPU. Note that the example training script falls back to "
-                "CPU when no GPU is available (for example on a Mac).")
+                "recorded on a CUDA GPU with ProfilerActivity.CUDA enabled. Traces recorded "
+                "on a machine without a CUDA GPU (for example a Mac) contain only CPU events.")
     if not all(t.has_profiler_steps for t in traces):
         return [f"{label}: no ProfilerStep annotations; times are trace totals, not per step. "
                 "Call prof.step() once per training iteration."]
