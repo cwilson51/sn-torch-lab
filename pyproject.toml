@@ -24,7 +24,7 @@ dev = [
 ]
 
 [project.scripts]
-generate-traces = "torch_trace_lab.cli:main"
+torch-lab = "torch_trace_lab.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
