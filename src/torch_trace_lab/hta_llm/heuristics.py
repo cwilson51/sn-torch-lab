@@ -21,6 +21,54 @@ class Flag:
         return asdict(self)
 
 
+MEANINGS = {
+    "GPU_IDLE_HIGH": "The GPU sits idle for a large share of the run, with no kernel executing. "
+                     "Check HOST_BOUND or LAUNCH_BOUND for the reason.",
+    "HOST_BOUND": "When the GPU is idle, it is mostly waiting for the CPU, usually for data "
+                  "loading or Python overhead between steps. Common once compile and AMP make "
+                  "the GPU fast enough that the data loader can't keep up.",
+    "LAUNCH_BOUND": "Kernels are so short that launching them from the CPU takes about as long as "
+                    "running them, so the GPU waits between launches.",
+    "TOP_KERNEL_DOMINANT": "A single kernel takes most of the GPU time. Often expected (a large "
+                           "GEMM or convolution); check that it runs as fast as it can.",
+    "MEMCPY_HIGH": "A large share of GPU time is spent copying data between host and device.",
+    "NO_AMP_SUSPECTED": "Matrix multiplies and convolutions run in fp32 or TF32 on a GPU whose "
+                        "tensor cores are faster in fp16/bf16 (automatic mixed precision).",
+}
+
+
+def thresholds() -> dict[str, str]:
+    """Each flag's trigger, from the current settings."""
+    return {
+        "GPU_IDLE_HIGH": f"GPU idle > {s.GPU_IDLE_HIGH_PCT:g}% of the GPU timeline",
+        "HOST_BOUND": f"host wait > {s.HOST_BOUND_PCT:g}% of GPU idle time, with GPU idle "
+                      f"≥ {s.HOST_BOUND_MIN_IDLE_PCT:g}%",
+        "LAUNCH_BOUND": f"median kernel shorter than the median CPU launch, or > "
+                        f"{s.LAUNCH_BOUND_SHORT_KERNEL_PCT:g}% of kernels < "
+                        f"{s.LAUNCH_BOUND_SHORT_KERNEL_US:g} µs; with GPU idle "
+                        f"≥ {s.LAUNCH_BOUND_MIN_IDLE_PCT:g}%",
+        "TOP_KERNEL_DOMINANT": f"one kernel > {s.TOP_KERNEL_DOMINANT_PCT:g}% of GPU kernel time",
+        "MEMCPY_HIGH": f"host-to-device + device-to-host copies > {s.MEMCPY_HIGH_PCT:g}% of "
+                       "GPU kernel time",
+        "NO_AMP_SUSPECTED": f"fp32 + TF32 > {s.NO_AMP_FP32_SHARE_PCT:g}% of GEMM/conv time, on a "
+                            f"GPU with compute capability ≥ {s.NO_AMP_MIN_COMPUTE_CAPABILITY:g}",
+    }
+
+
+def describe_flags() -> str:
+    """Plain-text listing of every flag, its meaning and its trigger."""
+    lines = ["Rule-based flags computed by `torch-lab analyze-traces` (thresholds from settings):",
+             ""]
+    for flag_id, trigger in thresholds().items():
+        lines += [flag_id, f"  {MEANINGS[flag_id]}", f"  Fires when: {trigger}.", ""]
+    lines.append("Severity (high / medium / low) grows with how far a value exceeds its threshold.")
+    return "\n".join(lines)
+
+
+def _flag(flag_id: str, severity: str, evidence: str) -> "Flag":
+    return Flag(flag_id, severity, evidence, thresholds()[flag_id])
+
+
 def _severity(value: float, threshold: float) -> str:
     if value >= 2 * threshold:
         return "high"
@@ -32,10 +80,9 @@ def _severity(value: float, threshold: float) -> str:
 def gpu_idle_high(m: RunMetrics) -> Flag | None:
     if m.gpu_idle_pct is None or m.gpu_idle_pct <= s.GPU_IDLE_HIGH_PCT:
         return None
-    return Flag("GPU_IDLE_HIGH", _severity(m.gpu_idle_pct, s.GPU_IDLE_HIGH_PCT),
-                f"GPU idle {m.gpu_idle_pct}% of the GPU timeline"
-                + (f" ({m.idle_ms_per_step} ms/step)" if m.idle_ms_per_step is not None else ""),
-                f"idle > {s.GPU_IDLE_HIGH_PCT}%")
+    return _flag("GPU_IDLE_HIGH", _severity(m.gpu_idle_pct, s.GPU_IDLE_HIGH_PCT),
+                 f"GPU idle {m.gpu_idle_pct}% of the GPU timeline"
+                 + (f" ({m.idle_ms_per_step} ms/step)" if m.idle_ms_per_step is not None else ""))
 
 
 def host_bound(m: RunMetrics) -> Flag | None:
@@ -43,10 +90,9 @@ def host_bound(m: RunMetrics) -> Flag | None:
             or m.gpu_idle_pct < s.HOST_BOUND_MIN_IDLE_PCT
             or m.host_wait_pct_of_idle <= s.HOST_BOUND_PCT):
         return None
-    return Flag("HOST_BOUND", _severity(m.gpu_idle_pct, s.GPU_IDLE_HIGH_PCT),
-                f"host wait is {m.host_wait_pct_of_idle}% of GPU idle time; GPU idle "
-                f"{m.gpu_idle_pct}% (the GPU waits for the CPU: data loading or Python overhead)",
-                f"host wait > {s.HOST_BOUND_PCT}% of idle, with idle ≥ {s.HOST_BOUND_MIN_IDLE_PCT}%")
+    return _flag("HOST_BOUND", _severity(m.gpu_idle_pct, s.GPU_IDLE_HIGH_PCT),
+                 f"host wait is {m.host_wait_pct_of_idle}% of GPU idle time; GPU idle "
+                 f"{m.gpu_idle_pct}% (the GPU waits for the CPU: data loading or Python overhead)")
 
 
 def launch_bound(m: RunMetrics) -> Flag | None:
@@ -65,27 +111,23 @@ def launch_bound(m: RunMetrics) -> Flag | None:
                        f"{m.median_launch_cpu_us} µs")
     if many_short:
         reasons.append(f"{m.short_kernel_pct}% of kernels < {s.LAUNCH_BOUND_SHORT_KERNEL_US:g} µs")
-    return Flag("LAUNCH_BOUND", "high" if faster_than_launch and many_short else "medium",
-                "; ".join(reasons) + f"; {m.kernels_per_step} kernels/step; GPU idle "
-                f"{m.gpu_idle_pct}%",
-                f"median kernel < median launch, or > {s.LAUNCH_BOUND_SHORT_KERNEL_PCT}% of kernels "
-                f"< {s.LAUNCH_BOUND_SHORT_KERNEL_US:g} µs; with idle ≥ {s.LAUNCH_BOUND_MIN_IDLE_PCT}%")
+    return _flag("LAUNCH_BOUND", "high" if faster_than_launch and many_short else "medium",
+                 "; ".join(reasons) + f"; {m.kernels_per_step} kernels/step; GPU idle "
+                 f"{m.gpu_idle_pct}%")
 
 
 def top_kernel_dominant(m: RunMetrics) -> Flag | None:
     if m.top_kernel_pct is None or m.top_kernel_pct <= s.TOP_KERNEL_DOMINANT_PCT:
         return None
-    return Flag("TOP_KERNEL_DOMINANT", _severity(m.top_kernel_pct, s.TOP_KERNEL_DOMINANT_PCT),
-                f"{m.top_kernel} is {m.top_kernel_pct}% of GPU kernel time",
-                f"one kernel > {s.TOP_KERNEL_DOMINANT_PCT}%")
+    return _flag("TOP_KERNEL_DOMINANT", _severity(m.top_kernel_pct, s.TOP_KERNEL_DOMINANT_PCT),
+                 f"{m.top_kernel} is {m.top_kernel_pct}% of GPU kernel time")
 
 
 def memcpy_high(m: RunMetrics) -> Flag | None:
     if m.memcpy_pct is None or m.memcpy_pct <= s.MEMCPY_HIGH_PCT:
         return None
-    return Flag("MEMCPY_HIGH", _severity(m.memcpy_pct, s.MEMCPY_HIGH_PCT),
-                f"host<->device memcpy is {m.memcpy_pct}% of GPU kernel time",
-                f"H2D + D2H > {s.MEMCPY_HIGH_PCT}%")
+    return _flag("MEMCPY_HIGH", _severity(m.memcpy_pct, s.MEMCPY_HIGH_PCT),
+                 f"host<->device memcpy is {m.memcpy_pct}% of GPU kernel time")
 
 
 def no_amp_suspected(m: RunMetrics, compute_capability: float | None) -> Flag | None:
@@ -96,11 +138,9 @@ def no_amp_suspected(m: RunMetrics, compute_capability: float | None) -> Flag | 
     if full <= s.NO_AMP_FP32_SHARE_PCT:
         return None
     detail = ", ".join(f"{p} {v}%" for p, v in shares.items())
-    return Flag("NO_AMP_SUSPECTED", "medium",
-                f"GEMM/conv kernel time by precision: {detail}; GPU compute capability "
-                f"{compute_capability:g} has tensor cores for fp16/bf16",
-                f"fp32 + tf32 > {s.NO_AMP_FP32_SHARE_PCT}% of GEMM/conv time, "
-                f"compute capability ≥ {s.NO_AMP_MIN_COMPUTE_CAPABILITY:g}")
+    return _flag("NO_AMP_SUSPECTED", "medium",
+                 f"GEMM/conv kernel time by precision: {detail}; GPU compute capability "
+                 f"{compute_capability:g} has tensor cores for fp16/bf16")
 
 
 def flags_for(m: RunMetrics, compute_capability: float | None) -> list[Flag]:

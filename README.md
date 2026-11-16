@@ -125,6 +125,7 @@ You can also pass a single trace file, or two or more run directories (`torch-la
 | `--top-n N` | Kernels per table (default: 15). |
 | `--model NAME` | Brine model (default: `$TORCH_LAB_BRINE_MODEL`, `$BRINE_MODEL`, or `DeepSeek-V4-Flash-0731`). |
 | `--no-llm` | Write the bundle, prompt, and a flags-only report without calling Brine. |
+| `--list-flags` | Print the rule-based flags, what each means, and the threshold that triggers it, then exit. No `PATH` needed. |
 
 **Brine settings.** Set the Brine endpoint and your own API key before running without `--no-llm`:
 

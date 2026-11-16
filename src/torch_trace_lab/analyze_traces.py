@@ -60,7 +60,7 @@ def add_parser(subparsers) -> None:
         epilog=LAYOUT,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("paths", nargs="+", type=Path, metavar="PATH",
+    parser.add_argument("paths", nargs="*", type=Path, metavar="PATH",
                         help="A run directory, a trace file, a directory of run directories, "
                              "or two or more run directories.")
     parser.add_argument("--output-dir", type=Path, default=Path("hta-report"),
@@ -76,10 +76,21 @@ def add_parser(subparsers) -> None:
                                         f"$BRINE_MODEL, or {settings.BRINE_DEFAULT_MODEL}).")
     parser.add_argument("--no-llm", action="store_true",
                         help="Write the bundle, prompt and a flags-only report; don't call Brine.")
+    parser.add_argument("--list-flags", action="store_true",
+                        help="Print the rule-based flags, what each means and when it fires, "
+                             "then exit. No PATH needed.")
     parser.set_defaults(func=run)
 
 
 def run(args) -> int:
+    if args.list_flags:
+        from torch_trace_lab.hta_llm import heuristics
+        print(heuristics.describe_flags())
+        return 0
+    if not args.paths:
+        print("torch-lab analyze-traces: error: the following arguments are required: PATH "
+              "(or use --list-flags)", file=sys.stderr)
+        return 2
     if cluster.on_login_node():
         print(login_node_message(), file=sys.stderr)
         return 1

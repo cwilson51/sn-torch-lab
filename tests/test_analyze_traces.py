@@ -61,6 +61,26 @@ def run(*args):
     return cli.main([CMD, *map(str, args)])
 
 
+def test_list_flags(monkeypatch, capsys):
+    monkeypatch.setenv("CC_CLUSTER", "nibi")  # cheap, so it works on a login node too
+    assert run("--list-flags") == 0
+    out = capsys.readouterr().out
+    for flag_id in ["GPU_IDLE_HIGH", "HOST_BOUND", "LAUNCH_BOUND", "TOP_KERNEL_DOMINANT",
+                    "MEMCPY_HIGH", "NO_AMP_SUSPECTED"]:
+        assert flag_id in out
+    assert "Fires when: GPU idle > 20% of the GPU timeline." in out
+
+
+def test_list_flags_matches_flag_thresholds():
+    from torch_trace_lab.hta_llm import heuristics
+    assert heuristics.MEANINGS.keys() == heuristics.thresholds().keys()
+
+
+def test_paths_required_without_list_flags(capsys):
+    assert run() == 2
+    assert "PATH" in capsys.readouterr().err
+
+
 def test_placement_login_node_refuses_before_loading(monkeypatch, two_runs, tmp_path, capsys):
     monkeypatch.setenv("CC_CLUSTER", "nibi")
     monkeypatch.setattr(ingest, "ingest", lambda *a, **k: pytest.fail("traces were loaded"))
