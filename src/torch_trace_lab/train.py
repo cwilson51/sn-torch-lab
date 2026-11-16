@@ -63,6 +63,8 @@ def torch_lab_metadata(args, device_type: str) -> dict:
         "dataloader_workers": args.nWorkers,
         "torch_compile": bool(args.compile),
         "precision": precision,
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
         "profiler_schedule": {
             "skip_first": args.skip_first,
             "wait": 0,
