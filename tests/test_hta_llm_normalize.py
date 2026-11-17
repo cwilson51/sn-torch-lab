@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from kineto import write_trace
+from kineto import ALLREDUCE, write_run, write_trace
 from torch_trace_lab.hta_llm import analyses, normalize, tables
 from torch_trace_lab.hta_llm.analyses import RunAnalysis
 
@@ -214,3 +214,93 @@ def test_failed_analysis_is_recorded(tmp_path, monkeypatch):
     a = analyses.run_all(tmp_path)
     assert "ZeroDivisionError" in a.unavailable["idle"]
     assert a.kernels is not None
+
+
+# --- Multi-rank (M3) ---------------------------------------------------------------------
+
+def test_comm_overlap_merges_and_intersects():
+    kernels = [("COMPUTATION", 0, 100), ("COMPUTATION", 50, 100),   # compute 0-150
+               ("COMMUNICATION", 100, 100),                        # comm 100-200
+               ("COMMUNICATION", 120, 30),                         # inside the first
+               ("MEMORY", 180, 50)]                                # not compute
+    assert analyses.comm_overlap(kernels) == {"comm_us": 100.0, "overlapped_us": 50.0}
+    assert analyses.comm_overlap([("COMPUTATION", 0, 10)]) == {"comm_us": 0.0,
+                                                               "overlapped_us": 0.0}
+
+
+def rank_metrics(rank, **values):
+    return normalize.RunMetrics("r", 5, values.pop("step_time_ms", 100.0), rank=rank, **values)
+
+
+def test_aggregate_ranks():
+    ranks = [rank_metrics(0, busy_ms_per_step=50.0, gpu_idle_pct=5.0),
+             rank_metrics(1, busy_ms_per_step=60.0, gpu_idle_pct=25.0),
+             rank_metrics(2, busy_ms_per_step=50.0, gpu_idle_pct=None)]
+    rows = {r["metric"]: r for r in normalize.aggregate_ranks(ranks)}
+    assert rows["busy_ms_per_step"] == {"metric": "busy_ms_per_step", "min": 50.0, "min_rank": 0,
+                                        "median": 50.0, "max": 60.0, "max_rank": 1,
+                                        "max_over_median": 1.2}
+    assert rows["gpu_idle_pct"]["median"] == 15.0  # ranks without a value are left out
+    assert "comm_pct" not in rows                  # no rank has it
+
+
+def test_slowest_rank_is_most_busy_not_longest_step():
+    ranks = [rank_metrics(0, busy_ms_per_step=50.0, step_time_ms=120.0),
+             rank_metrics(1, busy_ms_per_step=70.0, step_time_ms=100.0),
+             rank_metrics(2, busy_ms_per_step=70.0, step_time_ms=100.0)]
+    assert normalize.slowest_rank(ranks).rank == 1  # ties go to the lowest rank
+    no_busy = [rank_metrics(0, step_time_ms=90.0), rank_metrics(1, step_time_ms=95.0)]
+    assert normalize.slowest_rank(no_busy).rank == 1  # falls back to step time
+
+
+def test_real_hta_multi_rank(tmp_path):
+    write_run(tmp_path, 2, steps=4, kernels=[("volta_sgemm_128x64_nn", 400)],
+              comm_kernels=[(ALLREDUCE, 200)],
+              per_rank={1: {"kernels": [("volta_sgemm_128x64_nn", 600)],
+                            "comm_kernels": [(ALLREDUCE, 50)]}})
+    results = analyses.run_ranks(tmp_path)
+    assert sorted(results) == [0, 1]
+    assert all(a.unavailable == {} for a in results.values())
+    ms = [normalize.normalize_run("r", a, rank=r) for r, a in results.items()]
+    assert [m.busy_ms_per_step for m in ms] == [0.4, 0.6]
+    assert [m.comm_ms_per_step for m in ms] == [0.2, 0.05]
+    assert ms[0].comm_pct == 33.3
+    assert ms[0].overlap_pct == 0.0 and ms[0].exposed_comm_ms_per_step == 0.2  # serialized
+    assert normalize.slowest_rank(ms).rank == 1
+    # Host wait stays within the GPU's idle time, although the NCCL stream idles most of
+    # the step.
+    assert all(m.host_wait_ms_per_step <= m.idle_ms_per_step for m in ms)
+
+
+def test_comm_overlap_matches_hta(tmp_path):
+    write_run(tmp_path, 2, steps=4, kernels=[("volta_sgemm_128x64_nn", 400)],
+              comm_kernels=[(ALLREDUCE, 300)], comm_overlap=True,
+              per_rank={1: {"comm_overlap": False}})
+    ta = analyses.load(tmp_path)
+    with analyses.quiet():
+        analyses.trim_to_complete_steps(ta)
+        ours = analyses.comm(ta).set_index("rank")
+        hta = ta.get_comm_comp_overlap(visualize=False).set_index("rank")
+    for rank in (0, 1):
+        pct = 100 * ours.loc[rank, "overlapped_us"] / ours.loc[rank, "comm_us"]
+        assert pct == pytest.approx(hta.loc[rank, "comp_comm_overlap_pctg"], abs=0.01)
+    assert hta.loc[0, "comp_comm_overlap_pctg"] > 90
+    assert hta.loc[1, "comp_comm_overlap_pctg"] == 0
+
+
+def test_single_gpu_run_has_no_comm(tmp_path):
+    write_trace(tmp_path / "t.json", steps=4)
+    m = normalize.normalize_run("a", analyses.run_all(tmp_path))
+    assert m.comm_ms_per_step == 0.0 and m.comm_pct == 0.0
+    assert m.overlap_pct is None and m.exposed_comm_ms_per_step == 0.0
+    assert m.busy_ms_per_step == m.kernel_ms_per_step
+
+
+def test_unequal_step_counts_are_noted(tmp_path):
+    from torch_trace_lab.hta_llm import pipeline
+    write_run(tmp_path, 2, steps=5, per_rank={1: {"steps": 7}})
+    results = analyses.run_ranks(tmp_path)
+    assert results[0].steps == 4 and results[1].steps == 6
+    note = pipeline.step_count_note("r", results)
+    assert note and "4 to 6" in note
+    assert pipeline.step_count_note("r", {0: results[0]}) is None

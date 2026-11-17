@@ -3,7 +3,7 @@ import os
 
 import pytest
 
-from kineto import write_trace
+from kineto import ALLREDUCE, write_run, write_trace
 from test_hta_llm_brine import KEY, FakeSession, completion, models
 from torch_trace_lab import cli
 from torch_trace_lab.hta_llm import brine, ingest, sanitize
@@ -391,3 +391,102 @@ def test_prompt_lists_meta_keys_and_has_no_placeholders(two_runs, tmp_path):
     assert "{{" not in prompt
     assert "`batch_size_per_gpu`" in prompt and "`deepspeed.zero_stage`" in prompt
     assert "allow_tf32" in prompt  # remediation note on cuDNN's default TF32 convolutions
+
+
+# --- S3: one run on several GPUs (M3) ------------------------------------------------------
+
+@pytest.fixture
+def ddp_run(tmp_path):
+    """4 ranks: rank 2 does more compute (a straggler), rank 3 waits on its host."""
+    return write_run(tmp_path / "ddp-4gpu", 4, steps=6, gap_us=50,
+                     kernels=[("volta_sgemm_128x64_nn", 400), ("elementwise", 100)],
+                     comm_kernels=[(ALLREDUCE, 300)],
+                     per_rank={2: {"kernels": [("volta_sgemm_128x64_nn", 600),
+                                               ("elementwise", 100)]},
+                               3: {"gap_us": 400}})
+
+
+def test_s3_no_llm(ddp_run, tmp_path):
+    out = tmp_path / "out"
+    assert run(ddp_run, "--no-llm", "--output-dir", out) == 0
+    b = json.loads((out / "bundle.json").read_text())
+    assert b["scenario"] == "S3" and b["schema"] == "torch-lab-hta-bundle/3"
+    r = b["runs"][0]
+    assert r["ranks_analyzed"] == 4 and r["slowest_rank"] == 2
+    assert [row["rank"] for row in r["ranks"]] == [0, 1, 2, 3]
+    busy = next(row for row in r["rank_aggregate"] if row["metric"] == "busy_ms_per_step")
+    assert busy["max_rank"] == 2 and busy["max_over_median"] == 1.4
+    ids = {f["id"] for f in r["flags"]}
+    assert {"COMM_HEAVY", "POOR_OVERLAP", "RANK_STRAGGLER", "RANK_IDLE_IMBALANCE"} <= ids
+    assert all(f["evidence"].startswith("rank 2: ") for f in r["flags"]
+               if f["id"] in {"TOP_KERNEL_DOMINANT", "NO_AMP_SUSPECTED"})
+    md = (out / "bundle.md").read_text()
+    for heading in ["## 4. Rank comparison", "### Every rank",
+                    "## 5. Communication (slowest rank: rank 2)",
+                    "## 6. Temporal breakdown (slowest rank: rank 2)"]:
+        assert heading in md
+    report = (out / "report.md").read_text()
+    assert "slowest rank (most busy GPU time per step) is rank 2" in report
+    assert "### RANK_STRAGGLER" in report and "DistributedSampler" in report  # known fixes
+    prompt = (out / "prompt.md").read_text()
+    assert "single training run on 4 GPUs" in prompt
+    assert "{{" not in prompt and "<!--" not in prompt
+    assert "Runtime differences" not in prompt and "one GPU" not in prompt
+    assert "## RANK_STRAGGLER" in prompt and "## HOST_BOUND" in prompt
+
+
+def test_single_gpu_prompt_has_no_multi_gpu_remediation(two_runs, tmp_path):
+    out = tmp_path / "out"
+    assert run(two_runs, "--no-llm", "--output-dir", out) == 0
+    prompt = (out / "prompt.md").read_text()
+    assert "## HOST_BOUND" in prompt and "## NO_AMP_SUSPECTED" in prompt
+    assert not any(f"## {f}" in prompt for f in
+                   ["COMM_HEAVY", "POOR_OVERLAP", "RANK_STRAGGLER", "RANK_IDLE_IMBALANCE"])
+
+
+def test_s3_more_than_8_ranks_has_no_every_rank_table(tmp_path):
+    out = tmp_path / "out"
+    assert run(write_run(tmp_path / "big", 9, steps=3, comm_kernels=[(ALLREDUCE, 100)]),
+               "--no-llm", "--output-dir", out) == 0
+    r = json.loads((out / "bundle.json").read_text())["runs"][0]
+    assert r["ranks_analyzed"] == 9 and r["ranks"] == [] and r["rank_aggregate"]
+    assert "### Every rank" not in (out / "bundle.md").read_text()
+
+
+def test_comparing_multi_gpu_runs_exits_1(ddp_run, tmp_path, capsys):
+    write_trace(tmp_path / "single" / "t.json")
+    assert run(ddp_run, tmp_path / "single", "--no-llm", "--output-dir", tmp_path / "out") == 1
+    assert "Comparing multi-GPU runs is not yet supported" in capsys.readouterr().err
+
+
+def test_budget_plan_drops_all_ranks_tables_first():
+    from torch_trace_lab.hta_llm import pipeline
+    plan = pipeline.budget_plan(15, multi_rank=True)
+    assert plan[:4] == [(15, ()), (10, ()), (5, ()), (5, ("all-ranks tables",))]
+    assert plan[-1] == (5, ("all-ranks tables", "launch stats", "category comparison",
+                            "kernel-name appendix"))
+
+
+def test_s3_budget_never_drops_rank_comparison_or_slowest_rank(ddp_run, tmp_path,
+                                                               monkeypatch, capsys):
+    from torch_trace_lab.hta_llm import settings
+    monkeypatch.setattr(settings, "MAX_PROMPT_TOKENS", 10)
+    out = tmp_path / "out"
+    assert run(ddp_run, "--no-llm", "--output-dir", out) == 0
+    b = json.loads((out / "bundle.json").read_text())
+    assert b["budget"]["dropped_sections"] == [*settings.RANK_SECTIONS,
+                                               *settings.OPTIONAL_SECTIONS]
+    r = b["runs"][0]
+    assert r["ranks"] == []                        # dropped first
+    assert r["rank_aggregate"] and r["kernels"]    # never dropped
+    md = (out / "bundle.md").read_text()
+    assert "Rank comparison" in md and "GPU kernel breakdown (slowest rank: rank 2)" in md
+    assert "### Every rank" not in md
+    assert "still larger than" in capsys.readouterr().err
+
+
+def test_list_flags_includes_rank_flags(capsys):
+    assert run("--list-flags") == 0
+    out = capsys.readouterr().out
+    for flag_id in ["COMM_HEAVY", "POOR_OVERLAP", "RANK_STRAGGLER", "RANK_IDLE_IMBALANCE"]:
+        assert flag_id in out

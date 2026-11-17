@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from kineto import write_trace
+from kineto import write_run, write_trace
 from torch_trace_lab.hta_llm import ingest
 from torch_trace_lab.hta_llm.ingest import IngestError
 
@@ -76,12 +76,34 @@ def test_missing_ranks_are_listed(tmp_path):
         run_ingest(tmp_path, tmp_path / "r")
 
 
-def test_valid_multi_rank_is_not_yet_supported(tmp_path):
+def test_valid_multi_rank_run_is_sorted_by_rank(tmp_path):
     # Misleading file names: ranks come from distributedInfo only.
     write_trace(tmp_path / "r" / "rank3.json", rank=0, world_size=2)
     write_trace(tmp_path / "r" / "rank0.json", rank=1, world_size=2)
-    with pytest.raises(IngestError, match="not yet supported"):
+    runs, warnings = run_ingest(tmp_path, tmp_path / "r")
+    assert warnings == []
+    assert runs[0].ranks == 2
+    assert [t.path.name for t in runs[0].traces] == ["rank3.json", "rank0.json"]
+    assert sorted(p.name for p in runs[0].staged_dir.iterdir()) == ["rank0.json", "rank3.json"]
+
+
+def test_ranks_beyond_world_size_are_an_error(tmp_path):
+    for rank in range(3):
+        write_trace(tmp_path / "r" / f"{rank}.json", rank=rank, world_size=2)
+    with pytest.raises(IngestError, match="don't match world_size 2"):
         run_ingest(tmp_path, tmp_path / "r")
+
+
+@pytest.mark.parametrize("multi", [["a"], ["a", "b"]])
+def test_comparing_multi_gpu_runs_is_not_yet_supported(tmp_path, multi):
+    for label in ["a", "b"]:
+        if label in multi:
+            write_run(tmp_path / "exp" / label, 2)
+        else:
+            write_trace(tmp_path / "exp" / label / "t.json")
+    with pytest.raises(IngestError, match="Comparing multi-GPU runs is not yet supported"):
+        run_ingest(tmp_path, tmp_path / "exp")
+    assert not any((tmp_path / "_stage").iterdir())  # rejected before staging
 
 
 def test_misleading_filename_single_rank(tmp_path):

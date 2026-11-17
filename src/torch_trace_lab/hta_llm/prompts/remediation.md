@@ -37,3 +37,28 @@ Note: PyTorch runs cuDNN convolutions in TF32 by default (`torch.backends.cudnn.
 - On GPUs without bf16 (compute capability 7.x), use `dtype=torch.float16` with `torch.amp.GradScaler("cuda")`.
 - If staying in fp32, at least enable TF32: `torch.set_float32_matmul_precision("high")`.
 - Check accuracy after switching; most CNN and transformer training is unaffected.
+
+## COMM_HEAVY
+Communication (NCCL collectives) takes a large share of GPU time. Part of it may be ranks waiting for a slower rank inside a collective: check RANK_STRAGGLER and RANK_IDLE_IMBALANCE first, since fixing those also shrinks communication time.
+- Communicate less often: with gradient accumulation, skip gradient synchronization on all but the last micro-batch (the framework's no-sync option), so collectives run once per optimizer step.
+- Give each GPU more work per step (a larger per-GPU batch, if memory allows), so communication is a smaller share of the step.
+- Communicate less data: reduce gradients in bf16/fp16 where the framework supports it (e.g. a gradient compression or reduce-dtype setting).
+- Keep a run on as few nodes as fit: GPUs in one node talk over NVLink/PCIe, which is much faster than the network between nodes. Request whole nodes (`--gpus-per-node`) rather than GPUs spread across nodes.
+
+## POOR_OVERLAP
+Communication mostly runs while no compute runs, so it adds directly to each step.
+- Let communication start during the backward pass: gradient bucketing does this by default in PyTorch DDP. Tune the bucket size (e.g. DDP's `bucket_cap_mb`): smaller buckets start communicating sooner, larger ones have less overhead.
+- Avoid synchronizing the GPU inside the training step (`loss.item()`, `.cpu()`, `torch.cuda.synchronize()`), which forces communication to finish before compute continues.
+- If the model has parameters unused in some steps, avoid settings that make the framework search for them every step (e.g. DDP `find_unused_parameters=True`), since that delays communication.
+
+## RANK_STRAGGLER
+One rank does more GPU work per step than the others, and every other rank waits for it at each collective.
+- Check that every rank gets the same amount of work: equal per-rank batch sizes, a `DistributedSampler` (or equivalent) so the data is split evenly, and no extra work on rank 0 (logging, evaluation, checkpointing) inside the training step.
+- With variable-size inputs (sequences, images), bucket or pad inputs so per-rank batches cost about the same.
+- If the slow rank is always the same GPU or node across runs, suspect hardware: a throttled or shared GPU, or a slower node. Compare `nvidia-smi` clocks and temperatures on that node, and report it to cluster support if it persists.
+
+## RANK_IDLE_IMBALANCE
+Some ranks' GPUs sit idle much more than others', usually because their CPU side (data loading, Python work) is slower.
+- Give every rank the same number of DataLoader workers and enough CPU cores (`--cpus-per-task` per GPU in the Slurm job).
+- Copy the dataset to node-local storage (`$SLURM_TMPDIR`) on every node, so no rank reads from a slower shared filesystem.
+- Move rank-specific CPU work (logging, metric computation, checkpointing on rank 0) out of the step, or do it every N steps.

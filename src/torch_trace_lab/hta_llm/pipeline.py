@@ -8,7 +8,7 @@ import json
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from torch_trace_lab.hta_llm import (analyses, brine, bundle, context, heuristics, infer, ingest,
@@ -46,18 +46,32 @@ class Log:
         print(f"Error: {msg}", file=sys.stderr, flush=True)
 
 
+# The user.md section for each scenario; the other sections are removed.
+PROMPT_SECTIONS = {"S1": "single", "S2": "comparison", "S3": "distributed"}
+
+
 def build_prompt(b: dict, bundle_md: str) -> tuple[str, str]:
     system = report.prompt_file("system.md")
     user = report.prompt_file("user.md")
-    keep, drop = ("single", "comparison") if b["scenario"] == "S1" else ("comparison", "single")
-    user = _strip_section(user, drop)
+    keep = PROMPT_SECTIONS[b["scenario"]]
+    for drop in sorted(set(PROMPT_SECTIONS.values()) - {keep}):
+        user = _strip_section(user, drop)
     user = user.replace(f"<!-- {keep} -->\n", "").replace(f"<!-- /{keep} -->\n", "")
     user = (user.replace("{{N_RUNS}}", str(len(b["runs"])))
+                .replace("{{N_RANKS}}", str(b["runs"][0]["ranks_analyzed"]))
                 .replace("{{BASELINE}}", str(b["baseline"]))
                 .replace("{{META_KEYS}}", meta.key_list())
-                .replace("{{REMEDIATION}}", report.prompt_file("remediation.md").strip())
+                .replace("{{REMEDIATION}}", remediation_for(b["scenario"]))
                 .replace("{{BUNDLE}}", bundle_md))
     return system, user
+
+
+def remediation_for(scenario: str) -> str:
+    """remediation.md, without the multi-GPU flags' sections unless the run is multi-GPU."""
+    sections = report.remediation_sections()
+    if scenario != "S3":
+        sections = {k: v for k, v in sections.items() if k not in heuristics.RANK_FLAGS}
+    return "\n\n".join(f"## {flag_id}\n{text}" for flag_id, text in sections.items())
 
 
 def _strip_section(text: str, name: str) -> str:
@@ -76,7 +90,8 @@ class Collected:
     scenario: str
     baseline: int
     contexts: list[context.RunContext]
-    results: list[analyses.RunAnalysis]   # plain DataFrames; independent of the staging dir
+    # Per run, {rank: RunAnalysis}: plain DataFrames, independent of the staging dir.
+    results: list[dict[int, analyses.RunAnalysis]]
     warnings: list[str]
 
 
@@ -101,47 +116,75 @@ def collect(opts: Options, log: Log) -> Collected:
         warnings += conflicts
         for w in warnings:
             log.warn(w)
-        scenario = "S1" if len(runs) == 1 else "S2"
-        log.info(f"Scenario {scenario}: {len(runs)} run(s): {', '.join(labels)}")
+        scenario = "S2" if len(runs) > 1 else "S3" if runs[0].ranks > 1 else "S1"
+        log.info(f"Scenario {scenario}: {len(runs)} run(s): {', '.join(labels)}"
+                 + (f" ({runs[0].ranks} ranks)" if scenario == "S3" else ""))
 
         results = []
         for run in runs:
             start = time.monotonic()
             log.info(f"Analyzing {run.label} ...")
-            result = analyses.run_all(run.staged_dir)
-            for name, reason in result.unavailable.items():
+            result = analyses.run_ranks(run.staged_dir)
+            for name, reason in result[min(result)].unavailable.items():
                 log.warn(f"{run.label}: {name} analysis unavailable: {reason}")
+            if note := step_count_note(run.label, result):
+                log.warn(note)
+                warnings.append(note)
             results.append(result)
             log.info(f"  {run.label}: done ({time.monotonic() - start:.1f} s)")
     return Collected(scenario, baseline, contexts, results, warnings)
 
 
+def step_count_note(label: str, ranks: dict[int, analyses.RunAnalysis]) -> str | None:
+    """A data-quality note when ranks recorded different numbers of complete steps."""
+    counts = [a.steps for a in ranks.values() if a.steps]
+    if len(set(counts)) <= 1:
+        return None
+    return (f"{label}: ranks recorded different numbers of complete profiler steps "
+            f"({min(counts)} to {max(counts)}); each rank's per-step values use its own "
+            "step count.")
+
+
 def assemble(c: Collected, top_n: int, drop: tuple[str, ...] = (),
              top_n_requested: int | None = None) -> tuple[dict, str]:
-    """Stages 3-4: normalize, flag, bundle. Cheap, so the budget cascade can repeat it."""
+    """Stages 3-4: normalize, flag, bundle. Cheap, so the budget cascade can repeat it.
+
+    Each run is normalized per rank. The slowest rank (normalize.slowest_rank) represents
+    the run in the per-run tables and flags; the rank flags compare all ranks.
+    """
     names: dict[str, str] = {}
-    metrics, flags = [], {}
+    metrics, flags, ranks = [], {}, {}
     for ctx, result in zip(c.contexts, c.results):
-        m = normalize.normalize_run(ctx.label, result, top_n=top_n, names=names,
-                                    batch_size=ctx.batch_size)
+        per_rank = [normalize.normalize_run(ctx.label, a, top_n=top_n, names=names,
+                                            batch_size=ctx.batch_size, rank=r)
+                    for r, a in sorted(result.items())]
+        m = normalize.slowest_rank(per_rank)
         metrics.append(m)
-        flags[ctx.label] = heuristics.flags_for(m, ctx.compute_capability)
+        ranks[ctx.label] = per_rank
+        run_flags = heuristics.flags_for(m, ctx.compute_capability)
+        if len(per_rank) > 1:
+            run_flags = [replace(f, evidence=f"rank {m.rank}: {f.evidence}") for f in run_flags]
+        flags[ctx.label] = run_flags + heuristics.rank_flags(per_rank)
     diff, distinguishable = context.config_diff(c.contexts)
     budget = {"top_n_requested": top_n_requested or top_n, "top_n_used": top_n,
               "dropped_sections": list(drop)}
     b = bundle.build(scenario=c.scenario, metrics=metrics, contexts=c.contexts, flags=flags,
                      baseline=c.baseline, config_diff=diff, distinguishable=distinguishable,
                      data_quality=c.warnings, cluster=context.cluster_name(), kernel_names=names,
-                     budget=budget)
+                     budget=budget, ranks=ranks)
     return b, bundle.render_markdown(b)
 
 
-def budget_plan(top_n: int) -> list[tuple[int, tuple[str, ...]]]:
-    """Sizes to try, in order: as requested, smaller top-N, then fewer optional sections."""
+def budget_plan(top_n: int, multi_rank: bool = False) -> list[tuple[int, tuple[str, ...]]]:
+    """Sizes to try, in order: as requested, smaller top-N, then fewer optional sections.
+
+    Multi-rank runs drop the all-ranks tables first. The rank aggregation and the slowest
+    rank's tables are never dropped (spec §7.9).
+    """
     plan = [(top_n, ())]
     plan += [(n, ()) for n in settings.BUDGET_TOP_N_STEPS if n < top_n]
     smallest = plan[-1][0]
-    sections = settings.OPTIONAL_SECTIONS
+    sections = (settings.RANK_SECTIONS if multi_rank else ()) + settings.OPTIONAL_SECTIONS
     plan += [(smallest, sections[:i + 1]) for i in range(len(sections))]
     return plan
 
@@ -152,7 +195,8 @@ def estimate_tokens(system: str, user: str) -> int:
 
 def fit_budget(c: Collected, top_n: int, log: Log) -> tuple[dict, str, str, str, int]:
     """Assemble the bundle and prompt, shrinking them until the prompt fits (spec §7.9)."""
-    for i, (n, drop) in enumerate(budget_plan(top_n)):
+    multi_rank = any(len(r) > 1 for r in c.results)
+    for n, drop in budget_plan(top_n, multi_rank):
         b, bundle_md = assemble(c, n, drop, top_n_requested=top_n)
         system, user = build_prompt(b, bundle_md)
         tokens = estimate_tokens(system, user)

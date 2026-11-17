@@ -95,19 +95,28 @@ torch-lab generate-example-traces --time 0-01:00:00 --gpus h100:1   # change the
 torch-lab analyze-traces ./traces
 ```
 
-`analyze-traces` runs [Holistic Trace Analysis](https://github.com/facebookresearch/HolisticTraceAnalysis) on PyTorch Profiler traces, computes rule-based performance flags, and asks an LLM on [SHARCNET Brine](https://brine.sharcnet.ca) for a ranked, actionable report. With one run it answers "how can I make this faster?"; with several runs it answers "why do they differ, and how does the bottleneck mix shift?". Only single-GPU runs are supported for now.
+`analyze-traces` runs [Holistic Trace Analysis](https://github.com/facebookresearch/HolisticTraceAnalysis) on PyTorch Profiler traces, computes rule-based performance flags, and asks an LLM on [SHARCNET Brine](https://brine.sharcnet.ca) for a ranked, actionable report. With one run it answers "how can I make this faster?"; with several runs it answers "why do they differ, and how does the bottleneck mix shift?"; with one multi-GPU run it answers "where are the distributed-training bottlenecks?". Comparing several multi-GPU runs is not supported yet: analyze each one on its own.
 
 **Trace layout.** File names don't matter; the structure comes from directories:
 
 ```
-# one run                                # several runs to compare
-torch-lab analyze-traces my-run/         torch-lab analyze-traces experiments/
-my-run/                                  experiments/
-  trace.json                               baseline/trace.json
-                                           bs128-amp/trace.json
+# one run                         # several runs to compare          # one multi-GPU run
+torch-lab analyze-traces my-run/  torch-lab analyze-traces exps/    torch-lab analyze-traces ddp-run/
+my-run/                           exps/                             ddp-run/
+  trace.json                        baseline/trace.json               a.json  b.json  c.json  d.json
+                                    bs128-amp/trace.json
 ```
 
 You can also pass a single trace file, or two or more run directories (`torch-lab analyze-traces runA/ runB/`). Each run directory holds one run. The traces must be recorded on a CUDA GPU: traces from a CPU-only machine (including any Mac) have no GPU kernels to analyze.
+
+**Multi-GPU runs.** In a multi-GPU run directory, each trace file is one rank, identified by the `distributedInfo` that PyTorch writes into every distributed trace (never by its file name). All ranks must be present, from 0 to world size − 1. The bundle then adds:
+
+- a rank comparison: for each metric (step time, busy GPU time, idle, communication, overlap), the lowest, median and highest value across ranks, and which rank holds them; with 8 ranks or fewer, a table of every rank too;
+- communication: time in NCCL collectives, how much of it is exposed (no compute running at the same time) and how much overlaps compute;
+- the usual temporal, idle, kernel and launch tables for the **slowest rank**: the one with the most busy GPU time per step (GPU kernel time minus communication). Step time alone can't single it out, because with synchronous collectives every rank's step ends together: the faster ranks wait inside the collective;
+- four more flags: `COMM_HEAVY`, `POOR_OVERLAP`, `RANK_STRAGGLER` and `RANK_IDLE_IMBALANCE` (`--list-flags` shows their thresholds).
+
+The analysis is the same for DDP, FSDP and DeepSpeed for now: it doesn't detect the framework, so set `parallelism` in `--meta` if you want the report to know it.
 
 **Outputs** (in `./hta-report`, change with `--output-dir`):
 
@@ -158,7 +167,7 @@ You can also pass a single trace file, or two or more run directories (`torch-la
 
 If an inferred value disagrees with an embedded or `--meta` value, for example `--meta` says `fp32` but the kernels run in bf16, the given value is used. The disagreement is listed in the bundle's data-quality notes, and the report points it out: the run may not be configured the way you think.
 
-**Prompt size.** If the prompt would exceed about 24,000 tokens (for example with many runs), it is shrunk step by step until it fits. The kernel tables first drop to the top 10, then the top 5 kernels. After that, the launch stats, the per-category comparison and the kernel-name appendix are left out, in that order. Flags are always computed from the full data. The bundle's data-quality notes say what was left out.
+**Prompt size.** If the prompt would exceed about 24,000 tokens (for example with many runs), it is shrunk step by step until it fits. The kernel tables first drop to the top 10, then the top 5 kernels. After that, for a multi-GPU run, the every-rank table is left out; then the launch stats, the per-category comparison and the kernel-name appendix, in that order. The rank comparison and the slowest rank's tables are always kept. Flags are always computed from the full data. The bundle's data-quality notes say what was left out.
 
 **Brine settings.** Set the Brine endpoint and your own API key before running without `--no-llm`:
 
@@ -171,7 +180,7 @@ There is no built-in default URL. For safety, the URL must use https to an allow
 
 **What is sent to Brine.** Only aggregated tables (per-step times, top kernels, idle breakdown, flags) and allowlisted run facts (GPU model, precision, batch size, ...). Raw traces, file paths, usernames, hostnames, job IDs and Slurm data are never sent. Before every call a leak check scans the prompt for your username, home directory, cluster paths, hostname, Slurm values and account names, and blocks the call if it finds any. **`--run-note` text, `--meta` values and run directory names are sent as written, so keep sensitive information out of them.** Check `prompt.md` to see exactly what was sent.
 
-**Where to run it.** On your own machine, or inside a job on an Alliance cluster. A GPU is not needed. On a login node the command refuses to run, because loading the traces needs several GB of memory. Memory grows with the total size of the traces: a few traces of 35–75 MB each peak at about 5 GB, so `--mem=8G` suits typical single-GPU runs; request more for larger or more traces. Start an interactive job instead:
+**Where to run it.** On your own machine, or inside a job on an Alliance cluster. A GPU is not needed. On a login node the command refuses to run, because loading the traces needs several GB of memory. Memory grows with the total size of the traces: a few traces of 35–75 MB each peak at about 5 GB, so `--mem=8G` suits typical single-GPU runs; request more for larger or more traces. A multi-GPU run loads every rank's trace at once, so base the request on the total size of all its trace files. Start an interactive job instead:
 
 ```
 salloc --time=0:30:0 --cpus-per-task=4 --mem=8G --account=def-someuser
@@ -221,7 +230,7 @@ data["torch_lab"] = {
 trace.write_text(json.dumps(data))
 ```
 
-For distributed runs, every rank writes its own trace file into the same run directory. Multi-GPU analysis is planned but not supported yet.
+For distributed runs, every rank writes its own trace file into the same run directory (e.g. `run_dir / f"trace-{torch.distributed.get_rank()}.json"`). File names don't matter, as long as they differ: the rank comes from the trace itself.
 
 #### Comparing Brine models
 
