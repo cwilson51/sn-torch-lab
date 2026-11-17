@@ -1,7 +1,12 @@
-"""Run context for the bundle: allowlisted trace facts, embedded config, notes, config diff (§5.2).
+"""Run context for the bundle: allowlisted trace facts, config, notes, config diff (§5.2).
 
 Everything here is an allowlist. Trace metadata outside these fields (``traceName``,
 ``trace_id``, ``host_name``, ...) is never read.
+
+Config values come from three sources, in increasing priority: ``inferred`` from trace
+contents (infer.py), ``embedded`` in the trace's ``torch_lab`` object, and ``user``
+(``--meta``). The highest-priority value is used; an inferred value that disagrees with
+it becomes a data-quality note.
 """
 
 import os
@@ -28,13 +33,15 @@ MAX_TEXT = 120
 class RunContext:
     label: str
     facts: dict = field(default_factory=dict)    # from trace metadata (source: trace)
-    config: dict = field(default_factory=dict)   # name -> {"value", "source"}
+    # name -> {"value", "source"} (+ "confidence", "evidence" when inferred)
+    config: dict = field(default_factory=dict)
     notes: str | None = None
 
     @property
     def batch_size(self) -> int | None:
         entry = self.config.get("batch_size_per_gpu")
-        return entry["value"] if entry else None
+        value = entry["value"] if entry else None
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
 
     @property
     def compute_capability(self) -> float | None:
@@ -105,13 +112,82 @@ def parse_run_notes(notes: list[str], labels: list[str]) -> dict[str, str]:
     return result
 
 
-def build_contexts(runs: list[Run], notes: dict[str, str]) -> list[RunContext]:
-    contexts = []
+SOURCES = ("inferred", "embedded", "user")  # increasing priority
+SOURCE_NAMES = {"inferred": "the trace contents", "embedded": "the trace's torch_lab metadata",
+                "user": "--meta"}
+
+
+def precision_family(value) -> str | None:
+    """bf16 / fp16 / tf32 / fp32 for any precision label (``"fp32 (TF32 convs)"`` is tf32)."""
+    v = str(value).lower()
+    for family, pattern in (("bf16", "bf16"), ("fp16", "fp16"), ("fp16", "half"),
+                            ("tf32", "tf32"), ("fp32", "fp32"), ("fp32", "float32")):
+        if pattern in v:
+            return family
+    return None
+
+
+def same_value(key: str, a, b) -> bool:
+    """Whether two config values agree, allowing for how inference reports them."""
+    if key == "precision":
+        fa, fb = precision_family(a), precision_family(b)
+        if fa and fb:
+            return fa == fb
+    if key == "dataloader_workers" and ">0" in (a, b):
+        other = b if a == ">0" else a
+        return other == ">0" or (isinstance(other, int) and other > 0)
+    if isinstance(a, str) and isinstance(b, str):
+        return a.strip().lower() == b.strip().lower()
+    return a == b
+
+
+def resolve_config(label: str, layers: dict[str, dict]) -> tuple[dict, list[str]]:
+    """Merge ``{source: {key: entry}}``; the highest-priority source wins.
+
+    Returns (config, conflict notes). A conflict is an inferred value that disagrees with
+    the embedded or user value that was used instead.
+    """
+    config: dict = {}
+    for source in SOURCES:
+        for key, entry in (layers.get(source) or {}).items():
+            config[key] = {**entry, "source": source}
+    conflicts = []
+    for key, entry in (layers.get("inferred") or {}).items():
+        used = config[key]
+        if used["source"] == "inferred" or same_value(key, used["value"], entry["value"]):
+            continue
+        conflicts.append(
+            f"{label}: {key}: using {_fmt_value(used['value'])} from "
+            f"{SOURCE_NAMES[used['source']]}, but the trace contents suggest "
+            f"{_fmt_value(entry['value'])} (inferred, {entry['confidence']} confidence: "
+            f"{entry['evidence']}).")
+    return config, conflicts
+
+
+def _fmt_value(value) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value)
+
+
+def build_contexts(runs: list[Run], notes: dict[str, str], *,
+                   inferred: dict[str, dict] | None = None,
+                   user: dict[str, dict] | None = None) -> tuple[list[RunContext], list[str]]:
+    """Contexts per run, and conflict notes for the data-quality section.
+
+    ``inferred`` and ``user`` map run label -> {key: entry}.
+    """
+    contexts, conflicts = [], []
     for run in runs:
         meta = run.rank0.metadata
-        contexts.append(RunContext(run.label, trace_facts(meta), embedded_config(meta),
-                                   notes.get(run.label)))
-    return contexts
+        config, run_conflicts = resolve_config(run.label, {
+            "inferred": (inferred or {}).get(run.label, {}),
+            "embedded": embedded_config(meta),
+            "user": (user or {}).get(run.label, {}),
+        })
+        conflicts += run_conflicts
+        contexts.append(RunContext(run.label, trace_facts(meta), config, notes.get(run.label)))
+    return contexts, conflicts
 
 
 def cluster_name() -> str | None:
@@ -122,20 +198,40 @@ def cluster_name() -> str | None:
 DIFF_FACTS = ("gpu", "compute_capability", "gpu_memory_gb", "world_size")
 
 
+def _low_confidence(entry: dict) -> bool:
+    return entry.get("source") == "inferred" and entry.get("confidence") == "low"
+
+
 def config_diff(contexts: list[RunContext]) -> tuple[list[dict], bool]:
-    """Fields whose values differ across runs. Returns (rows, distinguishable)."""
+    """Fields whose values differ across runs. Returns (rows, distinguishable).
+
+    Each row has the field, its per-run values and sources, and ``source``: the shared
+    source, or ``"mixed"`` when runs got the value from different sources.
+    """
     rows = []
-    config_keys = [k for k in TORCH_LAB_KEYS if any(k in c.config for c in contexts)]
+    config_keys: list[str] = []
+    for c in contexts:
+        config_keys += [k for k in c.config if k not in config_keys]
     for key in config_keys:
-        values = {c.label: c.config[key]["value"] if key in c.config else "unknown"
-                  for c in contexts}
-        if len({repr(v) for v in values.values()}) > 1:
-            rows.append({"field": key, "source": "embedded", "values": values})
+        # Low-confidence inferred values never create a diff row on their own: they are
+        # left out of the comparison and shown as unknown if the field differs anyway.
+        low = {c.label for c in contexts if key in c.config and _low_confidence(c.config[key])}
+        values = {c.label: c.config[key]["value"] if key in c.config and c.label not in low
+                  else "unknown" for c in contexts}
+        compared = {repr(v) for label, v in values.items() if label not in low}
+        if len(compared) > 1:
+            sources = {c.label: c.config[key]["source"]
+                       if key in c.config and c.label not in low else "unknown"
+                       for c in contexts}
+            known = {s for s in sources.values() if s != "unknown"}
+            rows.append({"field": key, "source": known.pop() if len(known) == 1 else "mixed",
+                         "sources": sources, "values": values})
     for key in DIFF_FACTS:
         values = {c.label: c.facts.get(key, "unknown") for c in contexts}
         if len({repr(v) for v in values.values()}) > 1:
-            rows.append({"field": key, "source": "trace", "values": values})
+            rows.append({"field": key, "source": "trace",
+                         "sources": {c.label: "trace" for c in contexts}, "values": values})
     noted = [c.label for c in contexts if c.notes]
-    known = [r for r in rows if not all(v == "unknown" for v in r["values"].values())]
-    distinguishable = bool(known) or len(noted) == len(contexts)
+    known_rows = [r for r in rows if not all(v == "unknown" for v in r["values"].values())]
+    distinguishable = bool(known_rows) or len(noted) == len(contexts)
     return rows, distinguishable

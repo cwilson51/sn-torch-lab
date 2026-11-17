@@ -67,6 +67,10 @@ def add_parser(subparsers) -> None:
     parser.add_argument("--run-note", action="append", default=[], metavar="[LABEL=]TEXT",
                         help="Free-text context for a run, e.g. baseline=\"bs 64, 8 workers\". "
                              "Repeatable. Sent to Brine: no sensitive information.")
+    parser.add_argument("--meta", type=Path, metavar="FILE.toml",
+                        help="Optional run metadata: top-level keys apply to all runs, "
+                             "[runs.\"LABEL\"] tables to one run. Unknown keys are ignored. "
+                             "Sent to Brine: no sensitive information.")
     parser.add_argument("--baseline", metavar="LABEL",
                         help="Baseline run for comparisons (default: the first run).")
     parser.add_argument("--top-n", type=positive_int, default=settings.TOP_N,
@@ -100,7 +104,7 @@ def run(args) -> int:
 
     opts = pipeline.Options(paths=args.paths, output_dir=args.output_dir,
                             run_notes=args.run_note, baseline=args.baseline, top_n=args.top_n,
-                            model=args.model, no_llm=args.no_llm)
+                            model=args.model, no_llm=args.no_llm, meta=args.meta)
     try:
         return pipeline.run(opts)
     except KeyboardInterrupt:

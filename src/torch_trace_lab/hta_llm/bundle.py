@@ -13,7 +13,7 @@ from torch_trace_lab.hta_llm.heuristics import Flag
 from torch_trace_lab.hta_llm.normalize import (CATEGORIES, RunMetrics, category_comparison,
                                                kernel_comparison, step_time_differences)
 
-SCHEMA = "torch-lab-hta-bundle/1"
+SCHEMA = "torch-lab-hta-bundle/2"
 PATHLIKE = re.compile(r"(?:[A-Za-z]:)?(?:/[^/\s]+){2,}/")
 
 METRIC_FIELDS = [
@@ -58,7 +58,12 @@ def _strip_path(name: str) -> str:
 def build(*, scenario: str, metrics: list[RunMetrics], contexts: list[RunContext],
           flags: dict[str, list[Flag]], baseline: int, config_diff: list[dict],
           distinguishable: bool, data_quality: list[str], cluster: str | None,
-          kernel_names: dict[str, str]) -> dict:
+          kernel_names: dict[str, str], budget: dict | None = None) -> dict:
+    """``budget`` records how the bundle was shrunk to fit the prompt budget: top_n_used,
+    top_n_requested and dropped_sections (names from settings.OPTIONAL_SECTIONS)."""
+    budget = dict(budget or {})
+    budget.setdefault("dropped_sections", [])
+    dropped = set(budget["dropped_sections"])
     runs = []
     for m, c in zip(metrics, contexts):
         runs.append({
@@ -73,7 +78,7 @@ def build(*, scenario: str, metrics: list[RunMetrics], contexts: list[RunContext
         })
     used = {k["short"] for r in runs for k in r["kernels"]}
     names = {short: _strip_path(full)[:300] for full, short in kernel_names.items()
-             if short in used}
+             if short in used and "kernel-name appendix" not in dropped}
     base = metrics[baseline]
     derived = []
     for m in metrics:
@@ -97,18 +102,49 @@ def build(*, scenario: str, metrics: list[RunMetrics], contexts: list[RunContext
         "config_diff": config_diff if len(metrics) > 1 else [],
         "configs_distinguishable": distinguishable if len(metrics) > 1 else None,
         "kernel_comparison": kernel_comparison(metrics, baseline) if len(metrics) > 1 else [],
-        "category_comparison": category_comparison(metrics, baseline) if len(metrics) > 1 else [],
+        "category_comparison": (category_comparison(metrics, baseline)
+                                if len(metrics) > 1 and "category comparison" not in dropped
+                                else []),
         "derived": derived,
         "step_time_differences": step_time_differences(metrics) if len(metrics) > 1 else [],
         "data_quality": list(data_quality),
         "kernel_names": names,
+        "budget": budget,
     }
 
 
+def budget_note(budget: dict) -> str | None:
+    """A data-quality line saying how the bundle was shrunk, or None if it wasn't."""
+    parts = []
+    used, requested = budget.get("top_n_used"), budget.get("top_n_requested")
+    if used and requested and used != requested:
+        parts.append(f"kernel tables show the top {used} kernels instead of {requested}")
+    if budget.get("dropped_sections"):
+        parts.append("these sections were left out: " + ", ".join(budget["dropped_sections"]))
+    return "; ".join(parts) + "." if parts else None
+
+
 def _fmt(value) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
     if isinstance(value, dict):
         return ", ".join(f"{k}={v}" for k, v in value.items())
     return tables._cell(value)
+
+
+def _config_cell(entry: dict) -> str:
+    source = entry["source"]
+    if source == "inferred" and entry.get("confidence"):
+        source = f"inferred, {entry['confidence']}"
+    return f"{_fmt(entry['value'])} ({source})"
+
+
+def _diff_cell(row: dict, label: str) -> str:
+    value = _fmt(row["values"][label])
+    source = row.get("sources", {}).get(label)
+    if row["source"] == "mixed" and source not in (None, "unknown"):
+        return f"{value} ({source})"
+    return value
 
 
 def render_markdown(b: dict) -> str:
@@ -133,13 +169,23 @@ def render_markdown(b: dict) -> str:
         row = {"field": k}
         for r in runs:
             if k in r["config"]:
-                row[r["label"]] = f"{_fmt(r['config'][k]['value'])} ({r['config'][k]['source']})"
+                row[r["label"]] = _config_cell(r["config"][k])
             elif k in r["facts"]:
                 row[r["label"]] = f"{_fmt(r['facts'][k])} (trace)"
             else:
                 row[r["label"]] = "unknown"
         rows.append(row)
     out += [tables.render(rows, ["field", *labels]), ""]
+    out += ["Sources: trace = trace metadata; embedded = the trace's torch_lab config; "
+            "user = the user's --meta file; inferred = derived by torch-lab from the trace "
+            "contents, with a confidence. Inferred values are evidence, not fact.", ""]
+    evidence = [(r["label"], k, e) for r in runs for k, e in r["config"].items()
+                if e["source"] == "inferred" and e.get("evidence")]
+    if evidence:
+        out += ["### Evidence for inferred values", ""]
+        out += [f"- {label}: {k} = {_fmt(e['value'])}: {e['evidence']}."
+                for label, k, e in evidence]
+        out.append("")
     for r in runs:
         if r["notes"]:
             out.append(f"- Notes for {r['label']} (from the user): {r['notes']}")
@@ -150,7 +196,7 @@ def render_markdown(b: dict) -> str:
         out += ["### Config diff", ""]
         if b["config_diff"]:
             diff_rows = [{"field": d["field"], "source": d["source"],
-                          **{lbl: _fmt(d["values"][lbl]) for lbl in labels}}
+                          **{lbl: _diff_cell(d, lbl) for lbl in labels}}
                          for d in b["config_diff"]]
             out.append(tables.render(diff_rows, ["field", "source", *labels]))
         else:
@@ -163,6 +209,10 @@ def render_markdown(b: dict) -> str:
 
     out += ["## 2. Data-quality notes", ""]
     notes = list(b["data_quality"])
+    budget = b.get("budget") or {}
+    dropped = set(budget.get("dropped_sections", []))
+    if note := budget_note(budget):
+        notes.append(f"To fit the prompt budget, {note}")
     for r in runs:
         steps = r["metrics"]["steps"]
         notes.append(f"{r['label']}: {steps} profiler steps analyzed." if steps
@@ -222,13 +272,14 @@ def render_markdown(b: dict) -> str:
             out += [f"GEMM/conv time by precision: "
                     f"{_fmt(r['metrics']['gemm_conv_precision_pct'])} (%).", ""]
 
-    out += ["## 7. CUDA kernel launch stats", "", DESCRIPTIONS["launch"], "",
-            metric_table([("kernels_per_step", "kernels/step"),
-                          ("median_kernel_us", "median kernel (µs)"),
-                          ("median_launch_cpu_us", "median launch, CPU (µs)"),
-                          ("median_launch_delay_us", "median launch delay (µs)"),
-                          ("short_kernel_pct", "% kernels < 10 µs"),
-                          ("memcpy_pct", "H2D+D2H % of GPU time")]), ""]
+    if "launch stats" not in dropped:
+        out += ["## 7. CUDA kernel launch stats", "", DESCRIPTIONS["launch"], "",
+                metric_table([("kernels_per_step", "kernels/step"),
+                              ("median_kernel_us", "median kernel (µs)"),
+                              ("median_launch_cpu_us", "median launch, CPU (µs)"),
+                              ("median_launch_delay_us", "median launch delay (µs)"),
+                              ("short_kernel_pct", "% kernels < 10 µs"),
+                              ("memcpy_pct", "H2D+D2H % of GPU time")]), ""]
 
     out += ["## 8. Derived metrics", "", DESCRIPTIONS["derived"], "",
             tables.render(b["derived"]), ""]

@@ -24,3 +24,6 @@ docs/adr/
 brine-examples
 specs
 .env
+
+# scripts/eval_models.py output
+/eval/

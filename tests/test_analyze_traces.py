@@ -244,3 +244,150 @@ def test_run_note_reaches_bundle(two_runs, tmp_path):
     assert run(two_runs, "--run-note", "amp=bs 64, 4 workers", "--no-llm",
                "--output-dir", out) == 0
     assert "bs 64, 4 workers" in (out / "bundle.md").read_text()
+
+
+BF16_GEMM = ("ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_tn", 300)
+MULTI_LOADER = {"cat": "user_annotation",
+                "name": "enumerate(DataLoader)#_MultiProcessingDataLoaderIter.__next__"}
+
+
+@pytest.fixture
+def bf16_run(tmp_path):
+    run_dir = tmp_path / "bf16-run"
+    write_trace(run_dir / "t.json", steps=5, kernels=[BF16_GEMM, ("elementwise", 100)],
+                extra_events=[MULTI_LOADER])
+    return run_dir
+
+
+def test_inferred_values_reach_bundle_with_confidence(bf16_run, tmp_path):
+    out = tmp_path / "out"
+    assert run(bf16_run, "--no-llm", "--output-dir", out) == 0
+    b = json.loads((out / "bundle.json").read_text())
+    config = b["runs"][0]["config"]
+    assert config["precision"]["value"] == "bf16"
+    assert config["precision"]["source"] == "inferred"
+    assert config["precision"]["confidence"] == "high"
+    assert config["dataloader_workers"]["value"] == ">0"
+    md = (out / "bundle.md").read_text()
+    assert "bf16 (inferred, high)" in md
+    assert "Evidence for inferred values" in md
+
+
+def test_meta_conflict_is_noted_and_user_value_wins(bf16_run, tmp_path):
+    meta = tmp_path / "meta.toml"
+    meta.write_text('precision = "fp32"\ntask = "image classification"\nshoe_size = 44\n')
+    out = tmp_path / "out"
+    assert run(bf16_run, "--meta", meta, "--no-llm", "--output-dir", out) == 0
+    b = json.loads((out / "bundle.json").read_text())
+    config = b["runs"][0]["config"]
+    assert config["precision"] == {"value": "fp32", "source": "user"}
+    assert config["task"]["value"] == "image classification"
+    assert any("precision: using fp32 from --meta" in n and "bf16" in n
+               for n in b["data_quality"])
+    for name in ["bundle.md", "prompt.md", "bundle.json"]:
+        text = (out / name).read_text()
+        assert "shoe_size" not in text
+    assert "precision: using fp32 from --meta" in (out / "prompt.md").read_text()
+    assert "shoe_size is not a known key" in (out / "run.log").read_text()
+
+
+def test_meta_per_run_overrides_in_comparison(two_runs, tmp_path):
+    meta = tmp_path / "meta.toml"
+    meta.write_text('model = "ResNet-50"\n[runs."amp"]\nnotes = "channels_last"\n')
+    out = tmp_path / "out"
+    assert run(two_runs, "--meta", meta, "--run-note", "amp=lr 0.1", "--no-llm",
+               "--output-dir", out) == 0
+    b = json.loads((out / "bundle.json").read_text())
+    runs = {r["label"]: r for r in b["runs"]}
+    assert runs["amp"]["notes"] == "channels_last; lr 0.1"
+    assert runs["serial"]["config"]["model"] == {"value": "ResNet-50", "source": "user"}
+
+
+def test_invalid_meta_exits_1(two_runs, tmp_path, capsys):
+    meta = tmp_path / "meta.toml"
+    meta.write_text("precision = \n")
+    assert run(two_runs, "--meta", meta, "--no-llm", "--output-dir", tmp_path / "o") == 1
+    assert "not valid TOML" in capsys.readouterr().err
+
+
+def test_meta_notes_with_path_block_brine(leaky_env, tmp_path, monkeypatch, fake_brine):
+    monkeypatch.setenv("BRINE_API_KEY", KEY)
+    meta = tmp_path / "meta.toml"
+    meta.write_text('notes = "data in /home/jdoe/imagenet"\n')
+    out = tmp_path / "out"
+    assert run(leaky_env, "--meta", meta, "--output-dir", out) == 1
+    assert fake_brine.calls == []
+    assert "leak check" in (out / "report.md").read_text()
+
+
+def test_budget_plan_shrinks_in_order():
+    from torch_trace_lab.hta_llm import pipeline
+    assert pipeline.budget_plan(15) == [
+        (15, ()), (10, ()), (5, ()),
+        (5, ("launch stats",)),
+        (5, ("launch stats", "category comparison")),
+        (5, ("launch stats", "category comparison", "kernel-name appendix")),
+    ]
+    assert pipeline.budget_plan(3)[0] == (3, ())
+    assert all(n == 3 for n, _ in pipeline.budget_plan(3))
+
+
+def many_kernel_runs(tmp_path):
+    parent = tmp_path / "runs"
+    kernels = [(f"void some_namespace::kernel_number_{i}<float, 128, true>", 50 + i)
+               for i in range(16)]
+    for name in ["a", "b"]:
+        write_trace(parent / name / "t.json", steps=2, kernels=kernels)
+    return parent
+
+
+def test_budget_cascade_reduces_top_n_first(monkeypatch, tmp_path):
+    from torch_trace_lab.hta_llm import pipeline, settings
+    parent = many_kernel_runs(tmp_path)
+    collected = pipeline.collect(pipeline.Options([parent], tmp_path / "o"), pipeline.Log())
+    sizes = {}
+    for n, drop in pipeline.budget_plan(15):
+        b, md = pipeline.assemble(collected, n, drop, top_n_requested=15)
+        sizes[(n, drop)] = pipeline.estimate_tokens(*pipeline.build_prompt(b, md))
+    # Budget between the top-10 and top-15 sizes: only top-n shrinks.
+    monkeypatch.setattr(settings, "MAX_PROMPT_TOKENS", sizes[(10, ())])
+    out = tmp_path / "out"
+    assert run(parent, "--no-llm", "--output-dir", out) == 0
+    b = json.loads((out / "bundle.json").read_text())
+    assert b["budget"]["top_n_used"] == 10 and b["budget"]["dropped_sections"] == []
+    assert len(b["runs"][0]["kernels"]) == 11  # top 10 + remaining
+    assert "To fit the prompt budget, kernel tables show the top 10 kernels instead of 15" \
+        in (out / "bundle.md").read_text()
+
+
+def test_budget_cascade_drops_sections_then_warns(monkeypatch, tmp_path, capsys):
+    from torch_trace_lab.hta_llm import settings
+    parent = many_kernel_runs(tmp_path)
+    monkeypatch.setattr(settings, "MAX_PROMPT_TOKENS", 10)
+    out = tmp_path / "out"
+    assert run(parent, "--no-llm", "--output-dir", out) == 0
+    b = json.loads((out / "bundle.json").read_text())
+    assert b["budget"]["top_n_used"] == 5
+    assert b["budget"]["dropped_sections"] == list(settings.OPTIONAL_SECTIONS)
+    assert b["category_comparison"] == [] and b["kernel_names"] == {}
+    md = (out / "bundle.md").read_text()
+    assert "CUDA kernel launch stats" not in md and "Appendix" not in md
+    assert "still larger than" in capsys.readouterr().err
+
+
+def test_within_budget_bundle_is_unchanged(two_runs, tmp_path):
+    out = tmp_path / "out"
+    assert run(two_runs, "--no-llm", "--output-dir", out) == 0
+    b = json.loads((out / "bundle.json").read_text())
+    assert b["budget"]["dropped_sections"] == [] and b["budget"]["top_n_used"] == 15
+    assert b["budget"]["estimated_tokens"] < b["budget"]["max_prompt_tokens"]
+    assert "To fit the prompt budget" not in (out / "bundle.md").read_text()
+
+
+def test_prompt_lists_meta_keys_and_has_no_placeholders(two_runs, tmp_path):
+    out = tmp_path / "out"
+    assert run(two_runs, "--no-llm", "--output-dir", out) == 0
+    prompt = (out / "prompt.md").read_text()
+    assert "{{" not in prompt
+    assert "`batch_size_per_gpu`" in prompt and "`deepspeed.zero_stage`" in prompt
+    assert "allow_tf32" in prompt  # remediation note on cuDNN's default TF32 convolutions
