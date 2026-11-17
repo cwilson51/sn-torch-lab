@@ -23,6 +23,9 @@ COMM_HEAVY_PCT = 30.0             # NCCL kernels > this % of GPU kernel time
 POOR_OVERLAP_PCT = 50.0           # < this % of comm time overlaps compute, while COMM_HEAVY
 RANK_STRAGGLER_RATIO = 1.10       # max/median busy (non-comm) GPU time per step across ranks
 RANK_IDLE_IMBALANCE_POINTS = 10.0  # max - min GPU idle % across ranks
+# Comparisons across GPU counts (S4): weak-scaling efficiency vs. the baseline run, i.e. the
+# run's per-GPU throughput ÷ the baseline's (step time ratio when the batch size is unknown).
+SCALING_EFFICIENCY_MIN_PCT = 80.0
 # Per-rank tables are included only up to this many ranks (spec §7.2).
 MAX_RANKS_IN_TABLES = 8
 # Fewer complete profiler steps than this get a data-quality note: per-step means of so few
@@ -42,7 +45,7 @@ MAX_PROMPT_TOKENS = 24_000
 # Over budget, shrink the prompt in this order (spec §7.9): smaller kernel tables, then drop
 # optional bundle sections one by one; only then warn and send it anyway.
 BUDGET_TOP_N_STEPS = (10, 5)
-OPTIONAL_SECTIONS = ("launch stats", "category comparison", "kernel-name appendix")
+OPTIONAL_SECTIONS = ("launch stats", "category comparison", "trace diff", "kernel-name appendix")
 # Multi-rank bundles drop the all-ranks tables before OPTIONAL_SECTIONS. The rank aggregation
 # and the slowest rank's tables are never dropped: they are the bottleneck evidence.
 RANK_SECTIONS = ("all-ranks tables",)

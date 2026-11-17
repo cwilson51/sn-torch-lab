@@ -54,3 +54,22 @@ def test_real_single_gpu_run_is_not_ddp(tmp_path):
     assert "parallelism" not in r["config"]
     assert "num_nodes" not in r["config"]
     assert r["collectives"] == []
+
+
+def test_real_ddp_runs_compared(tmp_path):
+    """M5 (S4) on the two real DDP runs: same GPU count, different node layout."""
+    multi = _require(TRACES / "multi-gpu")
+    runs = [_require(multi / name) for name in sorted(DDP_RUNS)]
+    out = tmp_path / "out"
+    assert cli.main(["analyze-traces", *map(str, runs), "--diff-rank", "slowest", "--no-llm",
+                     "--output-dir", str(out)]) == 0
+    b = json.loads((out / "bundle.json").read_text())
+    assert b["scenario"] == "S4" and b["comparison_kind"] == "same framework"
+    assert [r["ranks_analyzed"] for r in b["runs"]] == [4, 4]
+    assert "num_nodes" in {d["field"] for d in b["config_diff"]}
+    assert not any("scaling_efficiency_pct" in r for r in b["derived"])  # same GPU count
+    (diff,) = b["trace_diff"].values()
+    assert "unavailable" not in diff and diff["rows"]
+    assert diff["rank"] == b["runs"][1]["slowest_rank"]
+    assert {c["collective"] for c in b["collectives_by_run"]} == {"all-reduce", "broadcast"}
+    assert b["budget"]["estimated_tokens"] <= b["budget"]["max_prompt_tokens"]

@@ -25,6 +25,7 @@ class Options:
     model: str | None = None
     no_llm: bool = False
     meta: Path | None = None
+    diff_rank: int | str = 0   # a rank number, or "slowest"
 
 
 class Log:
@@ -47,7 +48,8 @@ class Log:
 
 
 # The user.md section for each scenario; the other sections are removed.
-PROMPT_SECTIONS = {"S1": "single", "S2": "comparison", "S3": "distributed"}
+PROMPT_SECTIONS = {"S1": "single", "S2": "comparison", "S3": "distributed",
+                   "S4": "multi-comparison"}
 
 
 def build_prompt(b: dict, bundle_md: str) -> tuple[str, str]:
@@ -60,11 +62,18 @@ def build_prompt(b: dict, bundle_md: str) -> tuple[str, str]:
     user = (user.replace("{{N_RUNS}}", str(len(b["runs"])))
                 .replace("{{N_RANKS}}", str(b["runs"][0]["ranks_analyzed"]))
                 .replace("{{BASELINE}}", str(b["baseline"]))
+                .replace("{{RUN_GPUS}}", run_gpus(b))
                 .replace("{{META_KEYS}}", meta.key_list())
                 .replace("{{FRAMEWORK}}", framework_section(b))
                 .replace("{{REMEDIATION}}", remediation_for(b["scenario"]))
                 .replace("{{BUNDLE}}", bundle_md))
     return system, user
+
+
+def run_gpus(b: dict) -> str:
+    """'a (4 GPUs), b (1 GPU)' for the prompt."""
+    return ", ".join(f"{r['label']} ({r['ranks_analyzed']} GPU"
+                     f"{'s' if r['ranks_analyzed'] != 1 else ''})" for r in b["runs"])
 
 
 NO_FRAMEWORK = ("The bundle does not say which distributed framework (DDP, FSDP, DeepSpeed) "
@@ -73,25 +82,32 @@ NO_FRAMEWORK = ("The bundle does not say which distributed framework (DDP, FSDP,
 
 
 def framework_section(b: dict) -> str:
-    """Guidance for the run's distributed framework (its resolved ``parallelism``, so a
-    --meta value wins over the inferred one), or the don't-assume note."""
-    entry = b["runs"][0]["config"].get("parallelism") or {}
-    parallelism = entry.get("value")
-    guidance = frameworks.framework_prompt(parallelism)
-    if guidance:
-        return guidance
-    if parallelism and str(parallelism).lower() != "none":
-        return (f"The context table says the run uses {parallelism}. There is no "
-                f"{parallelism}-specific guidance here: when a fix depends on the framework's "
-                "settings, say so rather than guessing them.")
-    return NO_FRAMEWORK
+    """Guidance for each distributed framework the runs use (their resolved ``parallelism``,
+    so a --meta value wins over the inferred one), once each, or the don't-assume note."""
+    seen, parts = set(), []
+    who = "the run uses" if len(b["runs"]) == 1 else "a run uses"
+    for r in b["runs"]:
+        parallelism = (r["config"].get("parallelism") or {}).get("value")
+        key = str(parallelism or "").strip().lower()
+        if not key or key in ("none", "unknown") or key in seen:
+            continue
+        seen.add(key)
+        guidance = frameworks.framework_prompt(parallelism)
+        parts.append(guidance or
+                     f"The context table says {who} {parallelism}. There is no "
+                     f"{parallelism}-specific guidance here: when a fix depends on the "
+                     "framework's settings, say so rather than guessing them.")
+    return "\n\n".join(parts) if parts else NO_FRAMEWORK
 
 
 def remediation_for(scenario: str) -> str:
-    """remediation.md, without the multi-GPU flags' sections unless the run is multi-GPU."""
+    """remediation.md, without the multi-GPU flags' sections unless a run is multi-GPU, and
+    without SCALING_INEFFICIENT unless multi-GPU runs are compared (S4)."""
     sections = report.remediation_sections()
-    if scenario != "S3":
+    if scenario not in ("S3", "S4"):
         sections = {k: v for k, v in sections.items() if k not in heuristics.RANK_FLAGS}
+    if scenario != "S4":
+        sections = {k: v for k, v in sections.items() if k not in heuristics.S4_FLAGS}
     return "\n\n".join(f"## {flag_id}\n{text}" for flag_id, text in sections.items())
 
 
@@ -114,6 +130,11 @@ class Collected:
     # Per run, {rank: RunAnalysis}: plain DataFrames, independent of the staging dir.
     results: list[dict[int, analyses.RunAnalysis]]
     warnings: list[str]
+    # Trace diff (comparisons only): the requested --diff-rank, each run's representative
+    # rank, and per non-baseline run label the analyses.trace_diff table or why it failed.
+    diff_rank: int | str = 0
+    diff_ranks: list[int] = field(default_factory=list)
+    diffs: dict = field(default_factory=dict)
 
 
 def collect(opts: Options, log: Log) -> Collected:
@@ -138,9 +159,18 @@ def collect(opts: Options, log: Log) -> Collected:
         warnings += conflicts
         for w in warnings:
             log.warn(w)
-        scenario = "S2" if len(runs) > 1 else "S3" if runs[0].ranks > 1 else "S1"
-        log.info(f"Scenario {scenario}: {len(runs)} run(s): {', '.join(labels)}"
-                 + (f" ({runs[0].ranks} ranks)" if scenario == "S3" else ""))
+        multi_rank = any(r.ranks > 1 for r in runs)
+        scenario = (("S4" if multi_rank else "S2") if len(runs) > 1
+                    else "S3" if multi_rank else "S1")
+        if scenario == "S4":
+            log.info(f"Scenario S4: {len(runs)} runs: "
+                     + ", ".join(f"{r.label} ({r.ranks} rank{'s' if r.ranks != 1 else ''})"
+                                 for r in runs))
+        else:
+            log.info(f"Scenario {scenario}: {len(runs)} run(s): {', '.join(labels)}"
+                     + (f" ({runs[0].ranks} ranks)" if scenario == "S3" else ""))
+        if len(runs) > 1:
+            check_diff_rank(runs, opts.diff_rank)
 
         results = []
         for run in runs:
@@ -155,7 +185,77 @@ def collect(opts: Options, log: Log) -> Collected:
                     warnings.append(note)
             results.append(result)
             log.info(f"  {run.label}: done ({time.monotonic() - start:.1f} s)")
-    return Collected(scenario, baseline, contexts, results, warnings)
+        diff_ranks, diffs = [], {}
+        if len(runs) > 1:
+            diff_ranks = [representative_rank(opts.diff_rank, r, ctx.batch_size)
+                          for r, ctx in zip(results, contexts)]
+            diffs = trace_diffs(runs, results, baseline, diff_ranks, Path(stage), log)
+    return Collected(scenario, baseline, contexts, results, warnings, opts.diff_rank,
+                     diff_ranks, diffs)
+
+
+def check_diff_rank(runs: list[ingest.Run], choice: int | str) -> None:
+    """--diff-rank N must exist in every multi-rank run (a single-rank run uses its only
+    rank). Checked before the analyses, so a typo fails fast."""
+    if choice == "slowest":
+        return
+    missing = [r for r in runs if r.ranks > 1 and not 0 <= choice < r.ranks]
+    if missing:
+        raise ValueError(f"--diff-rank {choice}: not every run has that rank ("
+                         + ", ".join(f"{r.label} has ranks 0-{r.ranks - 1}" for r in missing)
+                         + "). Use a rank every multi-GPU run has, or --diff-rank slowest.")
+
+
+def representative_rank(choice: int | str, result: dict[int, analyses.RunAnalysis],
+                        batch_size: int | None = None) -> int:
+    """The rank of a run that the trace diff uses (spec §7.7): the requested rank, or with
+    ``slowest`` the rank with the most busy GPU time (normalize.slowest_rank). A single-rank
+    run always uses its only rank."""
+    ranks = sorted(result)
+    if len(ranks) == 1:
+        return ranks[0]
+    if choice == "slowest":
+        per_rank = [normalize.normalize_run("", result[r], rank=r, batch_size=batch_size)
+                    for r in ranks]
+        return normalize.slowest_rank(per_rank).rank
+    return int(choice)
+
+
+def trace_diffs(runs: list[ingest.Run], results: list[dict[int, analyses.RunAnalysis]],
+                baseline: int, ranks: list[int], stage: Path, log: Log) -> dict:
+    """HTA TraceDiff of each run's representative rank against the baseline's.
+
+    Each rank's trace is staged and loaded on its own, so at most two single-rank traces
+    are in memory at once. A failure makes that run's diff unavailable (spec §6).
+    Returns {label: DataFrame, or the reason it is unavailable}.
+    """
+    def load(i: int, label: str):
+        position = sorted(results[i]).index(ranks[i])
+        directory = ingest.stage_traces(runs[i].traces[position:position + 1],
+                                        stage / f"diff-{i}")
+        return analyses.load_rank_trace(directory, label)
+
+    others = [i for i in range(len(runs)) if i != baseline]
+    log.info(f"Trace diff against {runs[baseline].label} (rank {ranks[baseline]}) ...")
+    try:
+        control = load(baseline, "control")
+    except Exception as e:  # noqa: BLE001 - HTA raises many types
+        reason = f"the baseline trace could not be loaded: {type(e).__name__}: {e}"
+        log.warn(f"Trace diff unavailable: {reason}")
+        return {runs[i].label: reason for i in others}
+    diffs = {}
+    for i in others:
+        label = runs[i].label
+        try:
+            test = load(i, "test")
+            diffs[label] = analyses.trace_diff(
+                control, test, results[baseline][ranks[baseline]].iterations,
+                results[i][ranks[i]].iterations)
+        except Exception as e:  # noqa: BLE001
+            diffs[label] = f"{type(e).__name__}: {e}"
+            log.warn(f"{label}: trace diff unavailable: {diffs[label]}")
+        test = None  # free it before loading the next run
+    return diffs
 
 
 def run_topology(run: ingest.Run) -> dict:
@@ -199,6 +299,7 @@ def assemble(c: Collected, top_n: int, drop: tuple[str, ...] = (),
     """
     names: dict[str, str] = {}
     metrics, flags, ranks = [], {}, {}
+    gpus = [len(result) for result in c.results]
     for ctx, result in zip(c.contexts, c.results):
         per_rank = [normalize.normalize_run(ctx.label, a, top_n=top_n, names=names,
                                             batch_size=ctx.batch_size, rank=r)
@@ -210,13 +311,40 @@ def assemble(c: Collected, top_n: int, drop: tuple[str, ...] = (),
         if len(per_rank) > 1:
             run_flags = [replace(f, evidence=f"rank {m.rank}: {f.evidence}") for f in run_flags]
         flags[ctx.label] = run_flags + heuristics.rank_flags(per_rank)
+    base, base_gpus = metrics[c.baseline], gpus[c.baseline]
+    scaling = {}
+    base_batch = c.contexts[c.baseline].batch_size
+    for m, n, ctx in zip(metrics, gpus, c.contexts):
+        eff = None if m is base else normalize.scaling_efficiency(
+            m, base, n, base_gpus, ctx.batch_size, base_batch)
+        if eff is None:
+            continue
+        scaling[m.label] = eff
+        if flag := heuristics.scaling_inefficient(*eff, n, base.label, base_gpus):
+            flags[m.label].append(flag)
+    trace_diff = {}
+    if "trace diff" not in drop:
+        base_analysis = (c.results[c.baseline][c.diff_ranks[c.baseline]]
+                         if c.diff_ranks else None)
+        for i, (ctx, result) in enumerate(zip(c.contexts, c.results)):
+            if i == c.baseline or ctx.label not in c.diffs:
+                continue
+            d = c.diffs[ctx.label]
+            entry = {"rank": c.diff_ranks[i], "baseline_rank": c.diff_ranks[c.baseline]}
+            if isinstance(d, str):
+                entry["unavailable"] = d
+            else:
+                entry.update(normalize.trace_diff_rows(
+                    d, base_analysis.steps, result[c.diff_ranks[i]].steps, names, top_n))
+            trace_diff[ctx.label] = entry
     diff, distinguishable = context.config_diff(c.contexts)
     budget = {"top_n_requested": top_n_requested or top_n, "top_n_used": top_n,
               "dropped_sections": list(drop)}
     b = bundle.build(scenario=c.scenario, metrics=metrics, contexts=c.contexts, flags=flags,
                      baseline=c.baseline, config_diff=diff, distinguishable=distinguishable,
                      data_quality=c.warnings, cluster=context.cluster_name(), kernel_names=names,
-                     budget=budget, ranks=ranks)
+                     budget=budget, ranks=ranks, scaling=scaling, trace_diff=trace_diff,
+                     diff_rank=c.diff_rank if len(c.contexts) > 1 else None)
     return b, bundle.render_markdown(b)
 
 

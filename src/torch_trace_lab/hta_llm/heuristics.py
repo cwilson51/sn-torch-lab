@@ -44,6 +44,10 @@ MEANINGS = {
                       "synchronous collectives, every other rank waits for it.",
     "RANK_IDLE_IMBALANCE": "Ranks differ a lot in how long their GPU sits idle, which points "
                            "to uneven data loading or CPU work across ranks.",
+    "SCALING_INEFFICIENT": "A run on a different number of GPUs than the baseline gets much "
+                           "less throughput per GPU than the baseline does (weak scaling: "
+                           "each GPU is assumed to keep the same per-GPU batch size), so the "
+                           "added GPUs are partly spent on communication or waiting.",
 }
 
 
@@ -72,6 +76,10 @@ def thresholds() -> dict[str, str]:
                           f"{s.RANK_STRAGGLER_RATIO:g}× the median rank's",
         "RANK_IDLE_IMBALANCE": f"GPU idle % differs by > {s.RANK_IDLE_IMBALANCE_POINTS:g} "
                                "points between ranks",
+        "SCALING_INEFFICIENT": f"scaling efficiency < {s.SCALING_EFFICIENCY_MIN_PCT:g}% vs. "
+                               "the baseline run on a different number of GPUs (per-GPU "
+                               "throughput ÷ the baseline's, or the step-time ratio when the "
+                               "batch size is unknown)",
     }
 
 
@@ -174,6 +182,8 @@ def no_amp_suspected(m: RunMetrics, compute_capability: float | None) -> Flag | 
 
 # Flags that only a multi-GPU run can raise.
 RANK_FLAGS = ("COMM_HEAVY", "POOR_OVERLAP", "RANK_STRAGGLER", "RANK_IDLE_IMBALANCE")
+# Flags that only a comparison of runs on different numbers of GPUs (S4) can raise.
+S4_FLAGS = ("SCALING_INEFFICIENT",)
 
 
 def _median(ranks: list[RunMetrics], metric: str) -> float | None:
@@ -245,6 +255,18 @@ def rank_flags(ranks: list[RunMetrics]) -> list[Flag]:
     checks = [comm_heavy(ranks), poor_overlap(ranks), rank_straggler(ranks),
               rank_idle_imbalance(ranks)]
     return [f for f in checks if f is not None]
+
+
+def scaling_inefficient(efficiency_pct: float | None, basis: str | None, gpus: int,
+                        base_label: str, base_gpus: int) -> Flag | None:
+    """S4: weak-scaling efficiency vs. the baseline run below the threshold (spec §7a, M5)."""
+    if efficiency_pct is None or efficiency_pct >= s.SCALING_EFFICIENCY_MIN_PCT:
+        return None
+    loss = s.SCALING_EFFICIENCY_MIN_PCT - efficiency_pct
+    severity = "high" if efficiency_pct < 50 else "medium" if loss >= 10 else "low"
+    return _flag("SCALING_INEFFICIENT", severity,
+                 f"scaling efficiency {efficiency_pct}% on {gpus} GPU{'s' if gpus != 1 else ''} "
+                 f"vs. {base_label} on {base_gpus} GPU{'s' if base_gpus != 1 else ''}, by {basis}")
 
 
 def flags_for(m: RunMetrics, compute_capability: float | None) -> list[Flag]:

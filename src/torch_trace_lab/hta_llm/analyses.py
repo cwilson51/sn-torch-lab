@@ -24,6 +24,7 @@ ANALYSES = ("temporal", "idle", "kernels", "launch", "comm")
 class RunAnalysis:
     """One rank's results."""
     steps: int | None = None            # ProfilerSteps kept (the last, partial one is dropped)
+    iterations: list[int] | None = None  # the kept ProfilerStep numbers (for the trace diff)
     step_time_us: float | None = None   # mean ProfilerStep duration
     temporal: pd.DataFrame | None = None  # idle_us, compute_us, non_compute_us, kernel_us (+ pctg)
     idle: pd.DataFrame | None = None      # category, idle_us, ratio
@@ -57,22 +58,22 @@ def load(trace_dir: Path):
         # HTA would drop every GPU kernel launched in the last ProfilerStep; keep them, and let
         # trim_to_complete_steps decide whether that step is complete.
         ta = TraceAnalysis(trace_dir=str(trace_dir), include_last_profiler_step=True)
-    drop_gpu_annotations(ta)
+    drop_gpu_annotations(ta.t)
     return ta
 
 
-def drop_gpu_annotations(ta) -> None:
+def drop_gpu_annotations(trace) -> None:
     """Remove ``gpu_user_annotation`` events (ProfilerStep#N, record_function ranges).
 
     CUDA traces mirror each annotation on the GPU timeline with a stream, so HTA would
     count them as kernels: they would appear in the kernel table, inflate GPU kernel time,
     and double the ProfilerStep count.
     """
-    anno_id = ta.t.symbol_table.get_sym_id_map().get("gpu_user_annotation")
+    anno_id = trace.symbol_table.get_sym_id_map().get("gpu_user_annotation")
     if anno_id is None:
         return
-    for rank, df in ta.t.traces.items():
-        ta.t.traces[rank] = df[df["cat"] != anno_id]
+    for rank, df in trace.traces.items():
+        trace.traces[rank] = df[df["cat"] != anno_id]
 
 
 def _ranks(ta) -> list[int]:
@@ -257,8 +258,9 @@ def _last_step_complete(df: pd.DataFrame, iterations: list[int], launch_ids: lis
     return int(missing.iloc[-1]) <= int(missing.iloc[:-1].max())
 
 
-def trim_to_complete_steps(ta) -> dict[int, tuple[int, float]]:
-    """Keep only events from complete ProfilerSteps; return {rank: (steps, mean step µs)}.
+def trim_to_complete_steps(ta) -> dict[int, tuple[int, float, list[int]]]:
+    """Keep only events from complete ProfilerSteps; return
+    {rank: (steps, mean step µs, kept step numbers)}.
 
     The last recorded step is kept only if it is complete: no more of its kernel, memcpy and
     memset launches lack a GPU event than in earlier steps. A step cut off at export lacks more.
@@ -281,7 +283,7 @@ def trim_to_complete_steps(ta) -> dict[int, tuple[int, float]]:
             kept = iterations[:-1]
         trace.traces[rank] = df[df["iteration"].isin(kept)]
         kept_steps = steps[steps["iteration"].isin(kept)]
-        result[rank] = (len(kept), float(kept_steps["dur"].mean()))
+        result[rank] = (len(kept), float(kept_steps["dur"].mean()), [int(i) for i in kept])
     return result
 
 
@@ -301,8 +303,9 @@ def run_ranks(trace_dir: Path) -> dict[int, RunAnalysis]:
     results = {rank: RunAnalysis() for rank in _ranks(ta)}
     with quiet():
         try:
-            for rank, (steps, step_us) in trim_to_complete_steps(ta).items():
-                results[rank].steps, results[rank].step_time_us = steps, step_us
+            for rank, (steps, step_us, kept) in trim_to_complete_steps(ta).items():
+                r = results[rank]
+                r.steps, r.step_time_us, r.iterations = steps, step_us, kept
         except Exception as e:  # noqa: BLE001
             for r in results.values():
                 r.unavailable["steps"] = f"could not split the trace into steps: {e}"
@@ -320,6 +323,67 @@ def run_ranks(trace_dir: Path) -> dict[int, RunAnalysis]:
                     part = part.iloc[0].to_dict() if part is not None and not part.empty else None
                 setattr(r, name, part)
     return results
+
+
+# Event categories the trace diff compares, per HTA device type. Everything else (python_function
+# events with path-like names, annotations, CUDA runtime calls) is left out (spec §8a).
+DIFF_CATEGORIES = {"GPU": ("kernel", "gpu_memcpy", "gpu_memset"), "CPU": ("cpu_op",)}
+DIFF_COLUMNS = ["name", "device", "control_count", "test_count", "control_us", "test_us"]
+
+
+def load_rank_trace(trace_dir: Path, label: str):
+    """One staged rank as an HTA ``LabeledTrace`` for ``TraceDiff``, loaded like ``load``
+    (last profiler step's GPU events kept, GPU annotations dropped)."""
+    from hta.common.trace import Trace
+    from hta.configs.config import logger as hta_config_logger
+    from hta.trace_diff import LabeledTrace
+
+    hta_config_logger.setLevel(logging.ERROR)
+    with quiet():
+        trace = Trace(trace_dir=str(trace_dir))
+        trace.load_traces(include_last_profiler_step=True)
+        drop_gpu_annotations(trace)
+        return LabeledTrace(label=label, t=trace)  # already parsed: not parsed again
+
+
+def _names_in(lt, categories: tuple[str, ...]) -> set[str]:
+    sym_ids = lt.t.symbol_table.get_sym_id_map()
+    cat_ids = [sym_ids[c] for c in categories if c in sym_ids]
+    symbols = lt.t.symbol_table.get_sym_table()
+    names = set()
+    for rank in lt.ranks():
+        df = lt.t.get_trace(rank)
+        names |= {str(symbols[n]) for n in df.loc[df["cat"].isin(cat_ids), "name"].unique()}
+    return names
+
+
+def trace_diff(control, test, control_iterations: list[int] | None,
+               test_iterations: list[int] | None) -> pd.DataFrame:
+    """HTA ``TraceDiff.compare_traces`` of two ``LabeledTrace``s (one rank each), over the
+    given (complete) profiler steps, for GPU kernels/memcpy/memset and CPU ops only.
+
+    Returns DIFF_COLUMNS: per name, the call count and total µs in each trace (totals over
+    the steps, not per step). CPU op times include their child ops, as in the trace.
+    """
+    from hta.trace_diff import DeviceType, TraceDiff
+
+    frames = []
+    with quiet():
+        for device, device_type in (("GPU", DeviceType.GPU), ("CPU", DeviceType.CPU)):
+            df = TraceDiff.compare_traces(control, test, control_iteration=control_iterations,
+                                          test_iteration=test_iterations,
+                                          device_type=device_type)
+            allowed = (_names_in(control, DIFF_CATEGORIES[device])
+                       | _names_in(test, DIFF_CATEGORIES[device]))
+            df = df[df.index.isin(allowed)]
+            c, t = control.label, test.label
+            frames.append(pd.DataFrame({
+                "name": df.index.astype(str), "device": device,
+                "control_count": df[f"{c}_counts"].astype(int).to_numpy(),
+                "test_count": df[f"{t}_counts"].astype(int).to_numpy(),
+                "control_us": df[f"{c}_total_duration"].astype(float).to_numpy(),
+                "test_us": df[f"{t}_total_duration"].astype(float).to_numpy()}))
+    return pd.concat(frames, ignore_index=True)[DIFF_COLUMNS]
 
 
 def run_all(trace_dir: Path) -> RunAnalysis:

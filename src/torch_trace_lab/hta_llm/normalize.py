@@ -430,6 +430,79 @@ def category_comparison(runs: list[RunMetrics], baseline: int = 0) -> list[dict]
     return rows
 
 
+PATHLIKE = re.compile(r"(?:[A-Za-z]:)?(?:/[^/\s]+){2,}/")
+
+
+def strip_path(name: str) -> str:
+    """A name with any path-like prefix (``/home/user/...``) removed (spec §8a)."""
+    return PATHLIKE.sub("", name) if PATHLIKE.search(name) else name
+
+
+DIFF_CHANGES = ("added", "removed", "more calls", "fewer calls", "same calls")
+
+
+def trace_diff_rows(df, control_steps: int | None, test_steps: int | None,
+                    names: dict[str, str], top_n: int = settings.TOP_N) -> dict:
+    """Per-step view of an ``analyses.trace_diff`` table (control = the baseline run).
+
+    Times become ms/step and counts calls/step, each divided by its own run's step count
+    (totals when a run has no steps). Rows are the ``top_n`` ops with the largest absolute
+    change in ms/step. ``change`` compares calls per step; ``added`` / ``removed`` mean the
+    op occurs in only one run. GPU kernel names are shortened through the shared ``names``
+    mapping; CPU op names lose any path-like prefix. Returns ``{"rows", "summary"}``, where
+    the summary counts every op (not only the top N) by device and change.
+    """
+    cdiv, tdiv = control_steps or 1, test_steps or 1
+    rows = []
+    summary = {d: {c: 0 for c in DIFF_CHANGES} for d in ("GPU", "CPU")}
+    for rec in df.to_dict("records"):
+        c_calls, t_calls = r1(rec["control_count"] / cdiv), r1(rec["test_count"] / tdiv)
+        if not rec["control_count"]:
+            change = "added"
+        elif not rec["test_count"]:
+            change = "removed"
+        else:
+            change = ("more calls" if t_calls > c_calls else "fewer calls" if t_calls < c_calls
+                      else "same calls")
+        summary[rec["device"]][change] += 1
+        c_ms, t_ms = rec["control_us"] / cdiv / 1000, rec["test_us"] / tdiv / 1000
+        name = (add_short_name(names, rec["name"]) if rec["device"] == "GPU"
+                else strip_path(rec["name"])[:80])
+        rows.append({"op": name, "device": rec["device"], "baseline_ms_per_step": r2(c_ms),
+                     "run_ms_per_step": r2(t_ms), "delta_ms_per_step": r2(t_ms - c_ms),
+                     "baseline_calls_per_step": c_calls, "run_calls_per_step": t_calls,
+                     "change": change, "_abs": abs(t_ms - c_ms)})
+    rows.sort(key=lambda r: (-r["_abs"], r["device"], r["op"]))
+    for r in rows:
+        del r["_abs"]
+    return {"rows": rows[:top_n], "summary": summary}
+
+
+def scaling_efficiency(run: RunMetrics, base: RunMetrics, run_gpus: int, base_gpus: int,
+                       run_batch: int | None = None,
+                       base_batch: int | None = None) -> tuple[float, str] | None:
+    """Weak-scaling efficiency (%) of ``run`` against the baseline, and its basis.
+
+    Only for runs on a different number of GPUs than the baseline. With both batch sizes
+    known it is per-GPU throughput ÷ the baseline's; otherwise the baseline's step time ÷
+    the run's, which assumes the same per-GPU batch size. None when neither is available.
+    When the per-GPU batch sizes are known and differ, the basis says so: the efficiency
+    then also reflects the batch-size change, and can exceed 100%.
+    """
+    if run_gpus == base_gpus:
+        return None
+    if run.samples_per_s and base.samples_per_s:
+        basis = "per-GPU throughput"
+        if run_batch and base_batch and run_batch != base_batch:
+            basis += (f"; per-GPU batch sizes differ ({base_batch} vs. {run_batch}), so this "
+                      "also reflects the batch-size change")
+        return r1(100 * run.samples_per_s / base.samples_per_s), basis
+    if run.step_time_ms and base.step_time_ms:
+        return (r1(100 * base.step_time_ms / run.step_time_ms),
+                "step time (assumes the same per-GPU batch size)")
+    return None
+
+
 def resolve_baseline(labels: list[str], baseline: str | None) -> int:
     if baseline is None:
         return 0

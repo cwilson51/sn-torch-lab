@@ -355,3 +355,93 @@ def test_few_steps_are_noted(tmp_path):
 def test_launches_that_never_get_gpu_events_dont_drop_the_last_step(tmp_path, truncate, steps):
     write_trace(tmp_path / "t.json", steps=4, eventless_launches=2, truncate_last_step=truncate)
     assert analyses.run_all(tmp_path).steps == steps
+
+
+def test_kept_iterations_are_recorded(tmp_path):
+    write_trace(tmp_path / "t.json", steps=4, truncate_last_step=True)
+    assert analyses.run_all(tmp_path).iterations == [0, 1, 2]
+
+
+# --- M5: trace diff and scaling efficiency -------------------------------------------------
+
+def _diff_frame(rows):
+    return pd.DataFrame(rows, columns=analyses.DIFF_COLUMNS)
+
+
+def test_trace_diff_rows_per_step_changes_and_top_n():
+    df = _diff_frame([
+        # name, device, control_count, test_count, control_us, test_us
+        ("void at::native::vectorized_elementwise_kernel<4, at::native::AddFunctor<float>>",
+         "GPU", 10, 10, 10_000, 20_000),                    # 2 -> 5 calls/step, slower
+        ("ncclDevKernel_AllReduce_Sum_f32_RING_LL", "GPU", 0, 4, 0, 8_000),   # added
+        ("aten::old_op", "CPU", 4, 0, 2_000, 0),            # removed
+        ("aten::conv2d", "CPU", 10, 4, 5_000, 2_000),       # 2 -> 2 calls/step: same
+        ("/home/jdoe/proj/aten::weird", "CPU", 5, 8, 100, 100),  # 1 -> 4 calls/step: more
+    ])
+    names = {}
+    d = normalize.trace_diff_rows(df, control_steps=5, test_steps=2, names=names, top_n=3)
+    assert [r["op"] for r in d["rows"]] == [
+        "vectorized_elementwise_kernel<AddFunctor>", "ncclDevKernel_AllReduce_Sum_f32_RING_LL",
+        "aten::old_op"]
+    first = d["rows"][0]
+    assert (first["baseline_ms_per_step"], first["run_ms_per_step"],
+            first["delta_ms_per_step"]) == (2.0, 10.0, 8.0)
+    assert (first["baseline_calls_per_step"], first["run_calls_per_step"]) == (2.0, 5.0)
+    assert first["change"] == "more calls"
+    assert [r["change"] for r in d["rows"][1:]] == ["added", "removed"]
+    assert d["summary"]["GPU"] == {"added": 1, "removed": 0, "more calls": 1,
+                                   "fewer calls": 0, "same calls": 0}
+    assert d["summary"]["CPU"] == {"added": 0, "removed": 1, "more calls": 1,
+                                   "fewer calls": 0, "same calls": 1}
+    assert "vectorized_elementwise_kernel<AddFunctor>" in names.values()  # shared mapping
+    all_rows = normalize.trace_diff_rows(df, 5, 2, {}, top_n=10)["rows"]
+    assert "aten::weird" in [r["op"] for r in all_rows]  # path stripped
+    assert not any("/home/" in r["op"] for r in all_rows)
+
+
+def test_trace_diff_rows_without_steps_uses_totals():
+    df = _diff_frame([("k", "GPU", 3, 3, 3_000, 6_000)])
+    row = normalize.trace_diff_rows(df, None, None, {})["rows"][0]
+    assert (row["baseline_ms_per_step"], row["run_ms_per_step"], row["change"]) == \
+        (3.0, 6.0, "same calls")
+
+
+def _m(label, step, sps=None):
+    return normalize.RunMetrics(label, 5, step, samples_per_s=sps)
+
+
+def test_scaling_efficiency_by_throughput_and_step_time():
+    base, run4 = _m("a", 100.0, 640.0), _m("b", 125.0, 512.0)
+    assert normalize.scaling_efficiency(run4, base, 4, 1) == (80.0, "per-GPU throughput")
+    # No batch size: step time ratio, which assumes the same per-GPU batch.
+    eff, basis = normalize.scaling_efficiency(_m("b", 125.0), _m("a", 100.0), 4, 1)
+    assert eff == 80.0 and "assumes the same per-GPU batch size" in basis
+    # Same GPU count: no scaling efficiency; nothing known: none either.
+    assert normalize.scaling_efficiency(run4, base, 4, 4) is None
+    assert normalize.scaling_efficiency(_m("b", None), _m("a", None), 4, 1) is None
+
+
+def test_scaling_efficiency_notes_different_batch_sizes():
+    eff, basis = normalize.scaling_efficiency(_m("b", 100.0, 1280.0), _m("a", 100.0, 640.0),
+                                              4, 1, run_batch=128, base_batch=64)
+    assert eff == 200.0 and "per-GPU batch sizes differ (64 vs. 128)" in basis
+
+
+def test_trace_diff_on_hta_traces(tmp_path):
+    """analyses.trace_diff wraps HTA TraceDiff: only kernels/memcpy/memset and cpu_ops."""
+    write_trace(tmp_path / "a" / "t.json", steps=3,
+                python_functions=["/home/jdoe/x.py(1): f"])
+    write_trace(tmp_path / "b" / "t.json", steps=3, memcpy_us=20,
+                kernels=[("volta_sgemm_128x64_nn", 400), ("new_kernel", 50)])
+    a = analyses.load_rank_trace(tmp_path / "a", "control")
+    b = analyses.load_rank_trace(tmp_path / "b", "test")
+    df = analyses.trace_diff(a, b, [0, 1, 2], [0, 1])
+    assert list(df.columns) == analyses.DIFF_COLUMNS
+    gpu = df[df["device"] == "GPU"].set_index("name")
+    assert gpu.loc["new_kernel", "control_count"] == 0
+    assert gpu.loc["new_kernel", "test_count"] == 2   # only the two requested steps
+    assert gpu.loc["volta_sgemm_128x64_nn", "control_us"] == 1200
+    assert any(n.startswith("Memcpy HtoD") for n in gpu.index)
+    names = set(df["name"])
+    assert "aten::op" in names
+    assert not any(n.startswith(("ProfilerStep", "cuda", "/home")) for n in names)
