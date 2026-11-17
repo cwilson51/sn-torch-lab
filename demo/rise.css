@@ -5,6 +5,10 @@
   background: url("images/title-bg.svg") center / 100% 100% no-repeat;
 }
 
+.reveal:has(section.present:not(.stack) .pt-slide) {
+  background: url("images/pt-content-bg.svg") center / 100% 100% no-repeat;
+}
+
 .reveal .slide-number {
   font-size: 18px;
   background: transparent;
