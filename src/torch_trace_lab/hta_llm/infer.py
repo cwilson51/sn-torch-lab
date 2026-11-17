@@ -13,7 +13,7 @@ reaches the bundle through them.
 import re
 from dataclasses import dataclass, field
 
-from torch_trace_lab.hta_llm import settings
+from torch_trace_lab.hta_llm import frameworks, settings
 from torch_trace_lab.hta_llm.normalize import is_gemm_or_conv, kernel_precision
 
 # CPU ops whose first input is the activation: its leading dimension is the batch size.
@@ -43,6 +43,9 @@ class Evidence:
     batch_op_dtypes: dict[str, int] = field(default_factory=dict)  # input dtype of conv/linear
     first_batch_dims: list | None = None  # Input Dims of the first conv/linear, by time
     shapes_recorded: bool = False
+    ddp_reducer_ops: int = 0              # DDP gradient-reducer CPU ops
+    ddp_forward: int = 0                  # DistributedDataParallel.forward annotations
+    devices: set[int] = field(default_factory=set)  # local GPU index of the kernels
 
     @property
     def gemm_conv_total_us(self) -> float:
@@ -77,9 +80,14 @@ def collect_evidence(events: list) -> Evidence:
                 ev.transpose_us += dur
             if name.startswith("triton_"):
                 ev.triton_kernels += 1
+            device = (e.get("args") or {}).get("device")
+            if isinstance(device, int) and not isinstance(device, bool):
+                ev.devices.add(device)
         elif cat == "cpu_op":
             ev.cpu_ops += 1
-            if name in SCALER_OPS:
+            if frameworks.is_ddp_cpu_op(name):
+                ev.ddp_reducer_ops += 1
+            elif name in SCALER_OPS:
                 ev.scaler_ops += 1
             elif COMPILED.match(name):
                 ev.compiled_regions += 1
@@ -102,6 +110,8 @@ def collect_evidence(events: list) -> Evidence:
                 ev.multi_process_loader += 1
             elif COMPILED.match(name):
                 ev.compiled_regions += 1
+            elif name == frameworks.DDP_ANNOTATION:
+                ev.ddp_forward += 1
         elif cat in ("cuda_runtime", "cuda_driver") and name in GRAPH_LAUNCH:
             ev.graph_launches += 1
     return ev
@@ -195,6 +205,21 @@ def infer_memory_format(ev: Evidence) -> dict | None:
     return None
 
 
+def infer_parallelism(ev: Evidence) -> dict | None:
+    """DDP from its reducer ops and forward annotation. Other frameworks are M4b: a run
+    without DDP markers is left unknown, never "none"."""
+    if ev.ddp_reducer_ops and ev.ddp_forward:
+        return _entry("DDP", "high", f"{ev.ddp_reducer_ops} DDP gradient-reducer CPU ops and "
+                      f"{ev.ddp_forward} DistributedDataParallel.forward annotations")
+    if ev.ddp_reducer_ops:
+        return _entry("DDP", "medium", f"{ev.ddp_reducer_ops} DDP gradient-reducer CPU ops, "
+                      "no DistributedDataParallel.forward annotation")
+    if ev.ddp_forward:
+        return _entry("DDP", "medium", f"{ev.ddp_forward} DistributedDataParallel.forward "
+                      "annotations, no gradient-reducer CPU ops")
+    return None
+
+
 RULES = {
     "precision": infer_precision,
     "torch_compile": infer_torch_compile,
@@ -202,6 +227,7 @@ RULES = {
     "batch_size_per_gpu": infer_batch_size,
     "cuda_graphs": infer_cuda_graphs,
     "memory_format": infer_memory_format,
+    "parallelism": infer_parallelism,
 }
 
 
@@ -210,3 +236,29 @@ def infer_config(ev: Evidence | None) -> dict:
     if ev is None:
         return {}
     return {key: entry for key, rule in RULES.items() if (entry := rule(ev)) is not None}
+
+
+def infer_topology(devices_per_rank: list[set[int]], visible_gpus_per_rank: list[int],
+                   world_size: int) -> dict:
+    """num_nodes and gpus_per_node of a multi-rank run, or {} when the trace can't tell.
+
+    Each rank runs its kernels on its local GPU, so the distinct device indices across ranks
+    give the GPUs per node. That must match the GPUs each rank's process could see
+    (``deviceProperties``) and divide the world size. When every rank sees one GPU, as with
+    per-process CUDA_VISIBLE_DEVICES pinning, one node of N GPUs and N nodes of one GPU
+    look the same, so nothing is inferred.
+    """
+    if world_size <= 1 or len(devices_per_rank) != world_size:
+        return {}
+    if any(len(d) != 1 for d in devices_per_rank):
+        return {}
+    gpus_per_node = len(set().union(*devices_per_rank))
+    if gpus_per_node == 1 or world_size % gpus_per_node:
+        return {}
+    if any(v != gpus_per_node for v in visible_gpus_per_rank):
+        return {}
+    nodes = world_size // gpus_per_node
+    evidence = (f"the {world_size} ranks run on {gpus_per_node} distinct local GPU indices, "
+                f"and each rank's process sees {gpus_per_node} GPUs")
+    return {"num_nodes": _entry(nodes, "medium", evidence),
+            "gpus_per_node": _entry(gpus_per_node, "medium", evidence)}

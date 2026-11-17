@@ -11,8 +11,8 @@ import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from torch_trace_lab.hta_llm import (analyses, brine, bundle, context, heuristics, infer, ingest,
-                                     meta, normalize, report, sanitize, settings)
+from torch_trace_lab.hta_llm import (analyses, brine, bundle, context, frameworks, heuristics,
+                                     infer, ingest, meta, normalize, report, sanitize, settings)
 
 
 @dataclass
@@ -61,9 +61,30 @@ def build_prompt(b: dict, bundle_md: str) -> tuple[str, str]:
                 .replace("{{N_RANKS}}", str(b["runs"][0]["ranks_analyzed"]))
                 .replace("{{BASELINE}}", str(b["baseline"]))
                 .replace("{{META_KEYS}}", meta.key_list())
+                .replace("{{FRAMEWORK}}", framework_section(b))
                 .replace("{{REMEDIATION}}", remediation_for(b["scenario"]))
                 .replace("{{BUNDLE}}", bundle_md))
     return system, user
+
+
+NO_FRAMEWORK = ("The bundle does not say which distributed framework (DDP, FSDP, DeepSpeed) "
+                "the run uses unless the context table shows `parallelism`. Do not assume one; "
+                "when a fix depends on the framework, say so.")
+
+
+def framework_section(b: dict) -> str:
+    """Guidance for the run's distributed framework (its resolved ``parallelism``, so a
+    --meta value wins over the inferred one), or the don't-assume note."""
+    entry = b["runs"][0]["config"].get("parallelism") or {}
+    parallelism = entry.get("value")
+    guidance = frameworks.framework_prompt(parallelism)
+    if guidance:
+        return guidance
+    if parallelism and str(parallelism).lower() != "none":
+        return (f"The context table says the run uses {parallelism}. There is no "
+                f"{parallelism}-specific guidance here: when a fix depends on the framework's "
+                "settings, say so rather than guessing them.")
+    return NO_FRAMEWORK
 
 
 def remediation_for(scenario: str) -> str:
@@ -111,7 +132,8 @@ def collect(opts: Options, log: Log) -> Collected:
                 user[label], meta_notes = meta.as_config(values)
                 if meta_notes:
                     notes[label] = f"{meta_notes}; {notes[label]}" if label in notes else meta_notes
-        inferred = {r.label: infer.infer_config(r.rank0.evidence) for r in runs}
+        inferred = {r.label: {**infer.infer_config(r.rank0.evidence), **run_topology(r)}
+                    for r in runs}
         contexts, conflicts = context.build_contexts(runs, notes, inferred=inferred, user=user)
         warnings += conflicts
         for w in warnings:
@@ -127,12 +149,24 @@ def collect(opts: Options, log: Log) -> Collected:
             result = analyses.run_ranks(run.staged_dir)
             for name, reason in result[min(result)].unavailable.items():
                 log.warn(f"{run.label}: {name} analysis unavailable: {reason}")
-            if note := step_count_note(run.label, result):
-                log.warn(note)
-                warnings.append(note)
+            for note in (step_count_note(run.label, result), few_steps_note(run.label, result)):
+                if note:
+                    log.warn(note)
+                    warnings.append(note)
             results.append(result)
             log.info(f"  {run.label}: done ({time.monotonic() - start:.1f} s)")
     return Collected(scenario, baseline, contexts, results, warnings)
+
+
+def run_topology(run: ingest.Run) -> dict:
+    """Inferred num_nodes / gpus_per_node of a multi-rank run (see infer.infer_topology)."""
+    if run.ranks < 2 or any(t.evidence is None for t in run.traces):
+        return {}
+    visible = []
+    for t in run.traces:
+        props = t.metadata.get("deviceProperties")
+        visible.append(len(props) if isinstance(props, list) else 0)
+    return infer.infer_topology([t.evidence.devices for t in run.traces], visible, run.ranks)
 
 
 def step_count_note(label: str, ranks: dict[int, analyses.RunAnalysis]) -> str | None:
@@ -143,6 +177,17 @@ def step_count_note(label: str, ranks: dict[int, analyses.RunAnalysis]) -> str |
     return (f"{label}: ranks recorded different numbers of complete profiler steps "
             f"({min(counts)} to {max(counts)}); each rank's per-step values use its own "
             "step count.")
+
+
+def few_steps_note(label: str, ranks: dict[int, analyses.RunAnalysis]) -> str | None:
+    """A data-quality note when per-step values rest on only a few profiler steps."""
+    counts = [a.steps for a in ranks.values() if a.steps]
+    if not counts or min(counts) >= settings.FEW_STEPS:
+        return None
+    n = min(counts)
+    return (f"{label}: only {n} complete profiler step{'s' if n != 1 else ''} analyzed; "
+            "per-step values are means of so few steps and can be noisy. Profiling at least "
+            f"{settings.FEW_STEPS} active steps gives steadier numbers.")
 
 
 def assemble(c: Collected, top_n: int, drop: tuple[str, ...] = (),

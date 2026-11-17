@@ -8,11 +8,14 @@ rank. A failing analysis is recorded as unavailable and the others still run (sp
 import contextlib
 import io
 import logging
+import re
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
+
+from torch_trace_lab.hta_llm import frameworks
 
 ANALYSES = ("temporal", "idle", "kernels", "launch", "comm")
 
@@ -26,7 +29,7 @@ class RunAnalysis:
     idle: pd.DataFrame | None = None      # category, idle_us, ratio
     kernels: pd.DataFrame | None = None   # name, kernel_type, sum_us, mean_us, count
     launch: pd.DataFrame | None = None    # cpu_duration_us, gpu_duration_us, launch_delay_us
-    comm: dict | None = None              # comm_us, overlapped_us (see comm_overlap)
+    comm: dict | None = None              # comm_us, overlapped_us, by_collective, allreduce_*
     unavailable: dict[str, str] = field(default_factory=dict)
 
 
@@ -51,7 +54,9 @@ def load(trace_dir: Path):
 
     hta_config_logger.setLevel(logging.ERROR)
     with quiet():
-        ta = TraceAnalysis(trace_dir=str(trace_dir))
+        # HTA would drop every GPU kernel launched in the last ProfilerStep; keep them, and let
+        # trim_to_complete_steps decide whether that step is complete.
+        ta = TraceAnalysis(trace_dir=str(trace_dir), include_last_profiler_step=True)
     drop_gpu_annotations(ta)
     return ta
 
@@ -118,8 +123,26 @@ def kernels(ta) -> pd.DataFrame:
                                         num_kernels=1_000_000, include_memory_kernels=True)
     df = df.rename(columns={"sum (us)": "sum_us", "mean (us)": "mean_us"})
     df = df[df["name"] != "others"].copy()
-    df["count"] = (df["sum_us"] / df["mean_us"]).round().astype(int)
+    # HTA has no count column. sum/mean gives it, except for kernels shorter than 1 µs,
+    # which the trace records as 0 µs (0/0); count those in the trace itself.
+    count = (df["sum_us"] / df["mean_us"].where(df["mean_us"] > 0)).round()
+    if count.isna().any():
+        counts = kernel_counts(ta)
+        count = count.fillna(pd.Series([counts.get((r, n), 0) for r, n in
+                                        zip(df["rank"], df["name"])], index=df.index))
+    df["count"] = count.astype(int)
     return df[["rank", "name", "kernel_type", "sum_us", "mean_us", "count"]].reset_index(drop=True)
+
+
+def kernel_counts(ta) -> dict[tuple[int, str], int]:
+    """(rank, kernel name) -> number of GPU events with that name."""
+    symbols = ta.t.symbol_table.get_sym_table()
+    result = {}
+    for rank, df in ta.t.traces.items():
+        gpu = df[df["stream"].ne(-1)]
+        for name, n in gpu["name"].value_counts().items():
+            result[(rank, str(symbols[name]))] = int(n)
+    return result
 
 
 def launch(ta) -> pd.DataFrame:
@@ -172,11 +195,31 @@ def comm_overlap(kernels: list[tuple[str, float, float]]) -> dict:
             "overlapped_us": float(intersection_length(comm_iv, comp_iv))}
 
 
+def collective_breakdown(kernels: list[tuple[str, str | None, float, float]]) -> dict:
+    """Comm time per collective type, and how much all-reduce time overlaps compute.
+
+    ``kernels`` are (kernel_type, collective, start, duration); ``collective`` is
+    frameworks.collective_type of the kernel name (None for non-NCCL kernels). Each
+    collective's intervals are merged, as in comm_overlap. Returns ``by_collective``
+    ({collective: µs}, only those that ran), ``allreduce_us`` and ``allreduce_overlapped_us``.
+    """
+    comp_iv = merge_intervals([(s, s + d) for t, _, s, d in kernels if t == "COMPUTATION"])
+    by_collective = {}
+    for c in frameworks.COLLECTIVES:
+        iv = merge_intervals([(s, s + d) for _, k, s, d in kernels if k == c])
+        if iv:
+            by_collective[c] = float(sum(e - s for s, e in iv))
+    ar_iv = merge_intervals([(s, s + d) for _, k, s, d in kernels if k == "all-reduce"])
+    return {"by_collective": by_collective,
+            "allreduce_us": by_collective.get("all-reduce", 0.0),
+            "allreduce_overlapped_us": float(intersection_length(ar_iv, comp_iv))}
+
+
 def comm(ta) -> pd.DataFrame:
     from hta.utils.utils import get_kernel_type
 
     symbols = ta.t.symbol_table.get_sym_table()
-    types: dict[int, str] = {}
+    types: dict[int, tuple[str, str | None]] = {}
     rows = []
     for rank in _ranks(ta):
         df = ta.t.traces[rank]
@@ -184,30 +227,58 @@ def comm(ta) -> pd.DataFrame:
         kinds = []
         for name, ts, dur in zip(gpu["name"], gpu["ts"], gpu["dur"]):
             if name not in types:
-                types[name] = get_kernel_type(str(symbols[name]))
-            kinds.append((types[name], float(ts), float(dur)))
-        rows.append({"rank": rank, **comm_overlap(kinds)})
+                full = str(symbols[name])
+                kind = get_kernel_type(full)
+                types[name] = (kind, frameworks.collective_type(full)
+                               if kind == "COMMUNICATION" else None)
+            kinds.append((*types[name], float(ts), float(dur)))
+        rows.append({"rank": rank, **comm_overlap([(k, s, d) for k, _, s, d in kinds]),
+                     **collective_breakdown(kinds)})
     return pd.DataFrame(rows)
+
+
+# CUDA runtime/driver calls that put work on the GPU, each correlated with one GPU event
+# (cudaLaunchKernel, cudaLaunchKernelExC_v11060, cuLaunchKernel, cudaMemcpyAsync, ...).
+GPU_LAUNCH = re.compile(r"^cu(da)?(LaunchKernel|LaunchCooperativeKernel|Memcpy|Memset)")
+
+
+def _last_step_complete(df: pd.DataFrame, iterations: list[int], launch_ids: list[int]) -> bool:
+    """Whether the last step lost no GPU events at export.
+
+    Counts, per step, the GPU launches without a GPU event in the trace. Some launches never
+    get one in any step (e.g. zero-byte cudaMemsetAsync calls), so the last step is complete
+    if it misses no more than the worst earlier step; a step cut off at export misses more.
+    """
+    launches = df[df["name"].isin(launch_ids) & (df["stream"] < 0)
+                  & df["iteration"].isin(iterations) & (df["correlation"] > 0)]
+    recorded = set(df.loc[df["stream"] >= 0, "correlation"])
+    missing = (~launches["correlation"].isin(recorded)).groupby(launches["iteration"]).sum()
+    missing = missing.reindex(iterations, fill_value=0)
+    return int(missing.iloc[-1]) <= int(missing.iloc[:-1].max())
 
 
 def trim_to_complete_steps(ta) -> dict[int, tuple[int, float]]:
     """Keep only events from complete ProfilerSteps; return {rank: (steps, mean step µs)}.
 
-    The last recorded step is dropped, since it may be cut off at export. Every analysis then
-    sees exactly the same steps, so totals divided by ``steps`` are true per-step means.
-    HTA does its own trimming, but its cutoff shifts with GPU-side annotations, so it is not
-    relied on. Ranks without ProfilerStep annotations are left untrimmed and not returned.
+    The last recorded step is kept only if it is complete: no more of its kernel, memcpy and
+    memset launches lack a GPU event than in earlier steps. A step cut off at export lacks more.
+    Events outside any step are dropped. Every analysis then sees exactly the same steps, so
+    totals divided by ``steps`` are true per-step means. Ranks without ProfilerStep
+    annotations are left untrimmed and not returned.
     """
     trace = ta.t
     symbols = trace.symbol_table.get_sym_table()
     step_ids = [i for i, s in enumerate(symbols) if str(s).startswith("ProfilerStep#")]
+    launch_ids = [i for i, s in enumerate(symbols) if GPU_LAUNCH.search(str(s))]
     result = {}
     for rank, df in trace.traces.items():
         steps = df[df["name"].isin(step_ids) & (df["stream"] < 0)]  # CPU-side annotations
         iterations = sorted(i for i in steps["iteration"].unique() if i >= 0)
         if not iterations:
             continue
-        kept = iterations[:-1] if len(iterations) > 1 else iterations
+        kept = iterations
+        if len(iterations) > 1 and not _last_step_complete(df, iterations, launch_ids):
+            kept = iterations[:-1]
         trace.traces[rank] = df[df["iteration"].isin(kept)]
         kept_steps = steps[steps["iteration"].isin(kept)]
         result[rank] = (len(kept), float(kept_steps["dur"].mean()))

@@ -32,7 +32,7 @@ torch-lab = "torch_trace_lab.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-torch_trace_lab = ["templates/*.sh", "hta_llm/prompts/*.md"]
+torch_trace_lab = ["templates/*.sh", "hta_llm/prompts/*.md", "hta_llm/prompts/frameworks/*.md"]
 
 [build-system]
 requires = ["setuptools>=61"]

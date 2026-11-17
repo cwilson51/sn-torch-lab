@@ -114,11 +114,18 @@ You can also pass a single trace file, or two or more run directories (`torch-la
 **Multi-GPU runs.** In a multi-GPU run directory, each trace file is one rank, identified by the `distributedInfo` that PyTorch writes into every distributed trace (never by its file name). All ranks must be present, from 0 to world size − 1. The bundle then adds:
 
 - a rank comparison: for each metric (step time, busy GPU time, idle, communication, overlap), the lowest, median and highest value across ranks, and which rank holds them; with 8 ranks or fewer, a table of every rank too;
-- communication: time in NCCL collectives, how much of it is exposed (no compute running at the same time) and how much overlaps compute;
+- communication: time in NCCL collectives, how much of it is exposed (no compute running at the same time) and how much overlaps compute, the exposed all-reduce time, and the time per collective type (all-reduce, all-gather, reduce-scatter, broadcast, other) on every rank. A rank that waits for a slower one inside a collective counts the wait as communication, so the lowest rank's value is the best estimate of the collective's own cost (an upper bound on it);
 - the usual temporal, idle, kernel and launch tables for the **slowest rank**: the one with the most busy GPU time per step (GPU kernel time minus communication). Step time alone can't single it out, because with synchronous collectives every rank's step ends together: the faster ranks wait inside the collective;
 - four more flags: `COMM_HEAVY`, `POOR_OVERLAP`, `RANK_STRAGGLER` and `RANK_IDLE_IMBALANCE` (`--list-flags` shows their thresholds).
 
-The analysis is the same for DDP, FSDP and DeepSpeed for now: it doesn't detect the framework, so set `parallelism` in `--meta` if you want the report to know it.
+**DDP.** PyTorch DistributedDataParallel is detected from the trace (its gradient-reducer ops and `DistributedDataParallel.forward`). The report then also gets DDP-specific guidance: bucket size, `gradient_as_bucket_view`, `no_sync` with gradient accumulation, `static_graph`, `find_unused_parameters` and `broadcast_buffers`. FSDP and DeepSpeed are not detected yet. A run without DDP markers gets no framework, never a guess, and you can set `parallelism` in `--meta`. The node layout (`num_nodes`, `gpus_per_node`) is inferred too, from the local GPU each rank runs on. It stays unknown when each process sees only one GPU, because one node of 4 GPUs and 4 nodes of one GPU then look the same.
+
+The demo's DDP traces (ResNet-50 on 4 GPUs: one node with 4 GPUs, and 2 nodes with 2 GPUs each) are analyzed with:
+
+```
+torch-lab analyze-traces ./traces/multi-gpu/1_nodes_4_gpus
+torch-lab analyze-traces ./traces/multi-gpu/2_nodes_4_gpus
+```
 
 **Outputs** (in `./hta-report`, change with `--output-dir`):
 
@@ -147,7 +154,8 @@ The analysis is the same for DDP, FSDP and DeepSpeed for now: it doesn't detect 
    - DataLoader workers: whether worker processes were used (0 or >0), not how many;
    - batch size per GPU, from the input shape of the first convolution or linear layer. This needs `record_shapes=True`.
    - CUDA graphs;
-   - memory format (`channels_last` or NCHW with layout transposes).
+   - memory format (`channels_last` or NCHW with layout transposes);
+   - `parallelism = DDP`, and for multi-GPU runs `num_nodes` and `gpus_per_node` (see **DDP** above).
 
    Anything the trace doesn't show stays "unknown".
 2. **Embedded** in the trace as a top-level `torch_lab` object (see **Profiling your own code**).
@@ -165,7 +173,7 @@ The analysis is the same for DDP, FSDP and DeepSpeed for now: it doesn't detect 
    torch_compile = false
    ```
 
-   Other keys: `interconnect`, `num_nodes`, `gpus_per_node`, `cpu_cores_per_gpu` (CPU cores available to each GPU's process, which bounds useful `num_workers`), `parallelism` (`DDP`, `FSDP`, `DeepSpeed` or `none`), and `[ddp]`, `[fsdp]` and `[deepspeed]` tables for framework settings (e.g. `bucket_cap_mb`, `sharding_strategy`, `zero_stage`). Unknown keys and invalid values are ignored with a warning and are never sent.
+   Other keys: `interconnect`, `num_nodes`, `gpus_per_node`, `cpu_cores_per_gpu` (CPU cores available to each GPU's process, which bounds useful `num_workers`), `parallelism` (`DDP`, `FSDP`, `DeepSpeed` or `none`), and `[ddp]`, `[fsdp]` and `[deepspeed]` tables for framework settings (e.g. `[ddp]` `bucket_cap_mb`, `gradient_as_bucket_view`, `find_unused_parameters`, `static_graph`, `broadcast_buffers`; `[fsdp]` `sharding_strategy`; `[deepspeed]` `zero_stage`). Unknown keys and invalid values are ignored with a warning and are never sent.
 
 If an inferred value disagrees with an embedded or `--meta` value, for example `--meta` says `fp32` but the kernels run in bf16, the given value is used. The disagreement is listed in the bundle's data-quality notes, and the report points it out: the run may not be configured the way you think.
 

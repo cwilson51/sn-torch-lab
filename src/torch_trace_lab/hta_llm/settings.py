@@ -12,6 +12,8 @@ HOST_BOUND_MIN_IDLE_PCT = 5.0     # ... and the GPU is idle at least this much; 
 LAUNCH_BOUND_SHORT_KERNEL_US = 10.0
 LAUNCH_BOUND_SHORT_KERNEL_PCT = 50.0  # > this % of kernels shorter than the cutoff above
 LAUNCH_BOUND_MIN_IDLE_PCT = 10.0  # a busy GPU is not launch bound
+LAUNCH_BOUND_MAX_DELAY_RATIO = 5.0  # median launch delay <= this × median CPU launch time;
+                                    # longer, and kernels sit queued: the CPU is ahead
 TOP_KERNEL_DOMINANT_PCT = 30.0    # one kernel > this % of GPU kernel time
 MEMCPY_HIGH_PCT = 10.0            # H2D + D2H > this % of GPU kernel time
 NO_AMP_MIN_COMPUTE_CAPABILITY = 7.0
@@ -23,6 +25,9 @@ RANK_STRAGGLER_RATIO = 1.10       # max/median busy (non-comm) GPU time per step
 RANK_IDLE_IMBALANCE_POINTS = 10.0  # max - min GPU idle % across ranks
 # Per-rank tables are included only up to this many ranks (spec §7.2).
 MAX_RANKS_IN_TABLES = 8
+# Fewer complete profiler steps than this get a data-quality note: per-step means of so few
+# steps carry step-to-step noise (e.g. collective wait times that vary from step to step).
+FEW_STEPS = 5
 
 # Config inference from trace contents (hta_llm/infer.py)
 INFER_HIGH_SHARE_PCT = 80.0       # dominant precision >= this % of GEMM/conv time -> high confidence

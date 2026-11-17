@@ -3,7 +3,8 @@ import os
 
 import pytest
 
-from kineto import ALLREDUCE, write_run, write_trace
+from kineto import (ALLREDUCE, BROADCAST, DDP_EVENTS, DEVICE_PROPERTIES, write_run,
+                    write_trace)
 from test_hta_llm_brine import KEY, FakeSession, completion, models
 from torch_trace_lab import cli
 from torch_trace_lab.hta_llm import brine, ingest, sanitize
@@ -410,7 +411,7 @@ def test_s3_no_llm(ddp_run, tmp_path):
     out = tmp_path / "out"
     assert run(ddp_run, "--no-llm", "--output-dir", out) == 0
     b = json.loads((out / "bundle.json").read_text())
-    assert b["scenario"] == "S3" and b["schema"] == "torch-lab-hta-bundle/3"
+    assert b["scenario"] == "S3" and b["schema"] == "torch-lab-hta-bundle/4"
     r = b["runs"][0]
     assert r["ranks_analyzed"] == 4 and r["slowest_rank"] == 2
     assert [row["rank"] for row in r["ranks"]] == [0, 1, 2, 3]
@@ -490,3 +491,94 @@ def test_list_flags_includes_rank_flags(capsys):
     out = capsys.readouterr().out
     for flag_id in ["COMM_HEAVY", "POOR_OVERLAP", "RANK_STRAGGLER", "RANK_IDLE_IMBALANCE"]:
         assert flag_id in out
+
+
+# --- M4: DDP ---------------------------------------------------------------------------------
+
+def _gpus(n):
+    return [{**DEVICE_PROPERTIES[0], "id": i} for i in range(n)]
+
+
+@pytest.fixture
+def ddp_markers_run(tmp_path):
+    """2 nodes x 2 GPUs of DDP: reducer ops, all-reduce overlapping compute, a broadcast."""
+    return write_run(tmp_path / "ddp-2x2", 4, steps=4, gap_us=50,
+                     kernels=[("volta_sgemm_128x64_nn", 400), ("elementwise", 100)],
+                     comm_kernels=[(ALLREDUCE, 300), (BROADCAST, 20)], comm_overlap=True,
+                     extra_events=DDP_EVENTS, device_properties=_gpus(2),
+                     per_rank={r: {"device": r % 2} for r in range(4)})
+
+
+def test_ddp_run_bundle_and_prompt(ddp_markers_run, tmp_path):
+    out = tmp_path / "out"
+    assert run(ddp_markers_run, "--no-llm", "--output-dir", out) == 0
+    r = json.loads((out / "bundle.json").read_text())["runs"][0]
+    assert r["config"]["parallelism"]["value"] == "DDP"
+    assert r["config"]["parallelism"]["confidence"] == "high"
+    assert r["config"]["num_nodes"]["value"] == 2 and r["config"]["gpus_per_node"]["value"] == 2
+    assert [c["collective"] for c in r["collectives"]] == ["all-reduce", "broadcast"]
+    assert all(f"rank {i}" in r["collectives"][0] for i in range(4))
+    m = r["metrics"]
+    assert set(m["comm_by_collective_ms_per_step"]) == {"all-reduce", "broadcast"}
+    assert m["allreduce_ms_per_step"] == 0.3
+    assert 0 <= m["exposed_allreduce_ms_per_step"] < m["allreduce_ms_per_step"]
+    assert any(row["metric"] == "exposed_allreduce_ms_per_step" for row in r["rank_aggregate"])
+    md = (out / "bundle.md").read_text()
+    assert "### Communication by collective" in md and "DDP (inferred, high)" in md
+    assert "samples/s per GPU" in md and "samples/s, all GPUs" in md
+    prompt = (out / "prompt.md").read_text()
+    assert "parallelism = DDP" in prompt and "broadcast_buffers" in prompt
+    assert "Do not assume one" not in prompt and "{{" not in prompt
+
+
+def test_multi_rank_without_ddp_markers_assumes_no_framework(ddp_run, tmp_path):
+    out = tmp_path / "out"
+    assert run(ddp_run, "--no-llm", "--output-dir", out) == 0
+    r = json.loads((out / "bundle.json").read_text())["runs"][0]
+    assert "parallelism" not in r["config"]
+    assert "num_nodes" not in r["config"]  # every rank on device 0: can't tell
+    prompt = (out / "prompt.md").read_text()
+    assert "Do not assume one" in prompt and "parallelism = DDP" not in prompt
+
+
+def test_meta_parallelism_without_guidance(ddp_run, tmp_path):
+    meta = tmp_path / "meta.toml"
+    meta.write_text('parallelism = "FSDP"\n')
+    out = tmp_path / "out"
+    assert run(ddp_run, "--meta", meta, "--no-llm", "--output-dir", out) == 0
+    r = json.loads((out / "bundle.json").read_text())["runs"][0]
+    assert r["config"]["parallelism"] == {"value": "FSDP", "source": "user"}
+    prompt = (out / "prompt.md").read_text()
+    assert "uses FSDP. There is no FSDP-specific guidance" in prompt
+    assert "parallelism = DDP" not in prompt
+
+
+def test_meta_parallelism_conflict_is_noted(ddp_markers_run, tmp_path):
+    meta = tmp_path / "meta.toml"
+    meta.write_text('parallelism = "none"\nnum_nodes = 1\n')
+    out = tmp_path / "out"
+    assert run(ddp_markers_run, "--meta", meta, "--no-llm", "--output-dir", out) == 0
+    b = json.loads((out / "bundle.json").read_text())
+    assert b["runs"][0]["config"]["parallelism"]["value"] == "none"
+    notes = " ".join(b["data_quality"])
+    assert "parallelism: using none from --meta" in notes and "DDP" in notes
+    assert "num_nodes: using 1 from --meta" in notes
+    assert "parallelism = DDP" not in (out / "prompt.md").read_text()
+
+
+def test_throughput_is_per_gpu_and_total(tmp_path):
+    out = tmp_path / "out"
+    run_dir = write_run(tmp_path / "ddp", 2, steps=4, comm_kernels=[(ALLREDUCE, 100)],
+                        torch_lab={"batch_size_per_gpu": 64})
+    assert run(run_dir, "--no-llm", "--output-dir", out) == 0
+    row = json.loads((out / "bundle.json").read_text())["derived"][0]
+    assert row["samples_per_s_per_gpu"] and row["samples_per_s_total"] == round(
+        2 * row["samples_per_s_per_gpu"], 1)
+
+
+def test_single_gpu_throughput_has_no_total(two_runs, tmp_path):
+    out = tmp_path / "out"
+    assert run(two_runs, "--no-llm", "--output-dir", out) == 0
+    rows = json.loads((out / "bundle.json").read_text())["derived"]
+    assert all(r["samples_per_s_per_gpu"] for r in rows)
+    assert not any("samples_per_s_total" in r for r in rows)

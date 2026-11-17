@@ -12,10 +12,11 @@ from torch_trace_lab.hta_llm import settings, tables
 from torch_trace_lab.hta_llm.context import RunContext
 from torch_trace_lab.hta_llm.heuristics import Flag
 from torch_trace_lab.hta_llm.normalize import (CATEGORIES, RunMetrics, aggregate_ranks,
-                                               category_comparison, kernel_comparison,
+                                               category_comparison, collective_table,
+                                               kernel_comparison,
                                                step_time_differences)
 
-SCHEMA = "torch-lab-hta-bundle/3"
+SCHEMA = "torch-lab-hta-bundle/4"
 PATHLIKE = re.compile(r"(?:[A-Za-z]:)?(?:/[^/\s]+){2,}/")
 
 METRIC_FIELDS = [
@@ -27,12 +28,13 @@ METRIC_FIELDS = [
     "median_kernel_us", "median_launch_cpu_us",
     "median_launch_delay_us", "short_kernel_pct", "comm_ms_per_step", "comm_pct",
     "exposed_comm_ms_per_step", "overlap_pct", "busy_ms_per_step",
+    "comm_by_collective_ms_per_step", "allreduce_ms_per_step", "exposed_allreduce_ms_per_step",
 ]
 
 # Columns of the every-rank table, and labels for rank-comparison rows and columns.
 RANK_COLUMNS = ["rank", "step_time_ms", "busy_ms_per_step", "gpu_idle_pct",
                 "host_wait_ms_per_step", "comm_ms_per_step", "comm_pct",
-                "exposed_comm_ms_per_step", "overlap_pct"]
+                "exposed_comm_ms_per_step", "overlap_pct", "exposed_allreduce_ms_per_step"]
 METRIC_LABELS = {
     "step_time_ms": "step time (ms)", "busy_ms_per_step": "busy GPU time (ms/step)",
     "kernel_ms_per_step": "GPU kernel time (ms/step)", "gpu_idle_pct": "GPU idle %",
@@ -40,7 +42,13 @@ METRIC_LABELS = {
     "comm_ms_per_step": "communication (ms/step)", "comm_pct": "communication % of GPU time",
     "exposed_comm_ms_per_step": "exposed communication (ms/step)",
     "overlap_pct": "comm overlapped with compute %",
+    "allreduce_ms_per_step": "all-reduce (ms/step)",
+    "exposed_allreduce_ms_per_step": "exposed all-reduce (ms/step)",
 }
+
+DERIVED_HEADERS = {"step_time_ms": "step time (ms)",
+                   "samples_per_s_per_gpu": "samples/s per GPU",
+                   "samples_per_s_total": "samples/s, all GPUs"}
 
 DESCRIPTIONS = {
     "temporal": "How the GPU timeline splits into idle, compute kernels, and non-compute "
@@ -58,7 +66,9 @@ DESCRIPTIONS = {
               "Launch delay is the time from a launch call to the kernel starting on the GPU; "
               "a large delay means the CPU is running ahead of a busy GPU (queued work), "
               "not that launches are slow.",
-    "derived": "Computed by torch-lab, not by HTA. Throughput needs the batch size. "
+    "derived": "Computed by torch-lab, not by HTA. Throughput needs the batch size: "
+               "samples/s per GPU is the batch size per GPU ÷ step time; for a multi-GPU run, "
+               "the total is that × the number of GPUs. "
                "Deltas are against the baseline run, in ms and %.",
     "differences": "Each cell is the column run's step time minus the row run's step time; "
                    "the % is relative to the row run. Negative means the column run is faster. "
@@ -74,6 +84,10 @@ DESCRIPTIONS = {
             "compute kernel runs, so it adds to the step; overlapped communication is hidden "
             "behind compute. Waiting for a slower rank inside a collective counts as "
             "communication.",
+    "collectives": "Communication time per step by NCCL collective type, across ranks. "
+                   "A rank that waits for a slower rank inside a collective shows the wait "
+                   "as time in that collective, so the lowest value is the best estimate of "
+                   "the collective's own cost, and an upper bound on it.",
     "shared": "Kernels from any run's top list that occur in at least two runs. Values are "
               "each run's full ms/step for that kernel, even when it is outside that run's top "
               "list; '–' means the kernel does not occur in that run at all.",
@@ -109,6 +123,7 @@ def build(*, scenario: str, metrics: list[RunMetrics], contexts: list[RunContext
             "rank_aggregate": aggregate_ranks(per_rank) if multi else [],
             "ranks": ([{col: getattr(r, col) for col in RANK_COLUMNS} for r in per_rank]
                       if every_rank else []),
+            "collectives": collective_table(per_rank, per_rank=every_rank) if multi else [],
             "facts": dict(c.facts),
             "config": {k: dict(v) for k, v in c.config.items()},
             "notes": c.notes,
@@ -123,7 +138,12 @@ def build(*, scenario: str, metrics: list[RunMetrics], contexts: list[RunContext
     base = metrics[baseline]
     derived = []
     for m in metrics:
-        row = {"run": m.label, "step_time_ms": m.step_time_ms, "samples_per_s": m.samples_per_s}
+        row = {"run": m.label, "step_time_ms": m.step_time_ms,
+               "samples_per_s_per_gpu": m.samples_per_s}
+        n_ranks = len((ranks or {}).get(m.label) or [m])
+        if n_ranks > 1:
+            row["samples_per_s_total"] = (round(m.samples_per_s * n_ranks, 1)
+                                          if m.samples_per_s is not None else None)
         if len(metrics) > 1:
             if m.step_time_ms and base.step_time_ms:
                 row["step_time_vs_baseline_ms"] = round(m.step_time_ms - base.step_time_ms, 2)
@@ -309,7 +329,11 @@ def render_markdown(b: dict) -> str:
                               ("comm_pct", "communication % of GPU time"),
                               ("exposed_comm_ms_per_step", "exposed (ms/step)"),
                               ("overlap_pct", "overlapped with compute %"),
+                              ("exposed_allreduce_ms_per_step", "exposed all-reduce (ms/step)"),
                               ("busy_ms_per_step", "busy GPU time (ms/step)")]), ""]
+        if r["collectives"]:
+            out += ["### Communication by collective (ms/step, all ranks)", "",
+                    DESCRIPTIONS["collectives"], "", tables.render(r["collectives"]), ""]
 
     out += [heading("Temporal breakdown" + slowest), "", DESCRIPTIONS["temporal"], "",
             metric_table([("step_time_ms", "step time (ms)"), ("gpu_idle_pct", "GPU idle %"),
@@ -358,7 +382,7 @@ def render_markdown(b: dict) -> str:
                               ("memcpy_pct", "H2D+D2H % of GPU time")]), ""]
 
     out += [heading("Derived metrics"), "", DESCRIPTIONS["derived"], "",
-            tables.render(b["derived"]), ""]
+            tables.render(b["derived"], headers=DERIVED_HEADERS), ""]
     if b["step_time_differences"]:
         diffs = {(d["from"], d["to"]): d for d in b["step_time_differences"]}
         matrix = []

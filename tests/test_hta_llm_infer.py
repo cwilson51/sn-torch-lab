@@ -2,8 +2,8 @@
 
 import pytest
 
-from kineto import make_trace
-from torch_trace_lab.hta_llm.infer import collect_evidence, infer_config
+from kineto import ALLREDUCE, DDP_EVENTS, make_trace
+from torch_trace_lab.hta_llm.infer import collect_evidence, infer_config, infer_topology
 
 FP16_GEMM = ("sm90_xmma_fprop_implicit_gemm_f16f16_f16f32_f32_nhwckrsc_nhwc", 400)
 BF16_GEMM = ("ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_tn", 400)
@@ -107,3 +107,50 @@ def test_evidence_strings_hold_no_trace_text():
     for entry in c.values():
         assert "aten::" not in entry["evidence"]
         assert "xmma" not in entry["evidence"]
+
+
+# --- M4: DDP and topology ----------------------------------------------------------------
+
+@pytest.mark.parametrize("events, confidence", [
+    (DDP_EVENTS, "high"),
+    (DDP_EVENTS[:2], "medium"),   # reducer ops only
+    (DDP_EVENTS[2:], "medium"),   # DistributedDataParallel.forward only
+])
+def test_ddp_detected(events, confidence):
+    p = inferred(extra_events=events)["parallelism"]
+    assert (p["value"], p["confidence"], p["source"]) == ("DDP", confidence, "inferred")
+    assert "reducer::" not in p["evidence"]
+
+
+def test_no_ddp_markers_leave_parallelism_unknown():
+    # NCCL kernels alone don't say which framework; cuDNN's nhwcAddPaddingKernel holds "dd".
+    padding = ("void cudnn::engines_precompiled::nhwcAddPaddingKernel<float>", 10)
+    trace = make_trace(kernels=[FP32_GEMM, padding], comm_kernels=[(ALLREDUCE, 100)])
+    assert "parallelism" not in infer_config(collect_evidence(trace["traceEvents"]))
+
+
+def test_evidence_records_kernel_devices():
+    ev = collect_evidence(make_trace(device=3, comm_kernels=[(ALLREDUCE, 10)])["traceEvents"])
+    assert ev.devices == {3}
+
+
+@pytest.mark.parametrize("devices, visible, nodes, gpus", [
+    ([{0}, {1}, {2}, {3}], [4, 4, 4, 4], 1, 4),   # 1 node x 4 GPUs
+    ([{0}, {1}, {0}, {1}], [2, 2, 2, 2], 2, 2),   # 2 nodes x 2 GPUs
+])
+def test_topology(devices, visible, nodes, gpus):
+    t = infer_topology(devices, visible, 4)
+    assert t["num_nodes"]["value"] == nodes and t["gpus_per_node"]["value"] == gpus
+    assert t["num_nodes"]["confidence"] == "medium"
+
+
+@pytest.mark.parametrize("devices, visible, world_size", [
+    ([{0}, {0}, {0}, {0}], [1, 1, 1, 1], 4),       # each process pinned to one GPU
+    ([{0}, {1}, {2}, {3}], [8, 8, 8, 8], 4),       # sees more GPUs than the ranks use
+    ([{0}, {1}, {2}, {0}, {1}], [3, 3, 3, 3, 3], 5),  # 5 ranks don't fill 3-GPU nodes
+    ([{0, 1}, {1}], [2, 2], 2),                    # a rank on two GPUs
+    ([{0}, set()], [2, 2], 2),                     # a rank with no kernels
+    ([{0}], [1], 1),                               # single GPU
+])
+def test_topology_unknown(devices, visible, world_size):
+    assert infer_topology(devices, visible, world_size) == {}

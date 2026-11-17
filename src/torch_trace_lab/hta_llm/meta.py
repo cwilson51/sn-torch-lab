@@ -72,6 +72,7 @@ NESTED = {
         "gradient_as_bucket_view": _bool,
         "find_unused_parameters": _bool,
         "static_graph": _bool,
+        "broadcast_buffers": _bool,
     },
     "fsdp": {
         "sharding_strategy": _choice("FULL_SHARD", "SHARD_GRAD_OP", "HYBRID_SHARD", "NO_SHARD"),

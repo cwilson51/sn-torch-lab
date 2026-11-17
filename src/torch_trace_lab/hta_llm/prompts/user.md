@@ -27,16 +27,18 @@ Lead with the rule-based flags. Under **Findings**, give the top 3–5 bottlenec
 - **Communication vs. compute:** how much of the GPU time is communication (COMM_HEAVY), and how much of it is exposed rather than overlapped with compute (POOR_OVERLAP);
 - **Single-GPU bottlenecks** on the slowest rank (the other flags), which slow every rank down through the collectives.
 
+Findings backed by a flag that fired come first. If RANK_STRAGGLER, RANK_IDLE_IMBALANCE, COMM_HEAVY or POOR_OVERLAP did not fire, the matching imbalance or communication cost is below its threshold: you may mention it briefly as minor (for example, to explain why ranks wait inside collectives), but not as a top bottleneck.
+
 For each one, give:
 - **Evidence:** the flag(s) and numbers from the bundle, naming the rank where a number is per rank;
 - **Likely cause:** marked as a hypothesis when the data cannot confirm it. Remember that ranks waiting for a slower rank inside a collective show that wait as communication time;
 - **Fix:** chosen from the remediation guide;
 - **How to verify:** which number in a re-run bundle should change, and in which direction.
 
-The bundle does not say which distributed framework (DDP, FSDP, DeepSpeed) the run uses unless the context table shows `parallelism`. Do not assume one; when a fix depends on the framework, say so.
+{{FRAMEWORK}}
 <!-- /distributed -->
 
-Whenever you suggest recording run settings for next time, note that a `--meta` file accepts only these keys (anything else is ignored): {{META_KEYS}}. For any other setting, suggest a free-text `notes` entry instead of inventing a key.
+Whenever you suggest recording run settings for next time, note that a `--meta` file accepts only these keys (anything else is ignored): {{META_KEYS}}. For any other setting, suggest a free-text `notes` entry instead of inventing a key. The values to record are the ones the analyzed run actually used, not the ones you recommend changing to. A `--meta` file is TOML: write examples as `key = value` (strings quoted, e.g. `precision = "tf32"`), with framework settings in a table such as `[ddp]`.
 
 # Remediation guide (known fixes per flag)
 
