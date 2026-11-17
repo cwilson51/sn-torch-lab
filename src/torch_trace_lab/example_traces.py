@@ -189,8 +189,8 @@ def add_parser(subparsers) -> None:
             "job, or offers to submit a job from an Alliance login node."
         ),
     )
-    parser.add_argument("--output-dir", default="traces",
-                        help="Directory for traces (default: ./traces).")
+    parser.add_argument("--output-dir", default="traces/single-gpu",
+                        help="Directory for traces (default: ./traces/single-gpu).")
     parser.add_argument("--batch-size", type=batch_size_arg, default="auto",
                         help="Training batch size, or 'auto' to pick the largest power of 2 "
                              "that fits in GPU memory, up to 512 (32 on CPU). Default: auto.")

@@ -179,6 +179,10 @@ def test_invalid_batch_size(value, capsys):
     assert exc.value.code == 2
 
 
+def test_default_output_dir_is_single_gpu():
+    assert cli.build_parser().parse_args([CMD]).output_dir == "traces/single-gpu"
+
+
 def test_each_config_writes_its_own_run_directory(tmp_path):
     runs = et.trace_runs(64, tmp_path)
     dirs = [args[args.index("--output_dir") + 1] for _, args in runs]
