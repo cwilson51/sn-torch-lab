@@ -16,6 +16,13 @@ TOP_KERNEL_DOMINANT_PCT = 30.0    # one kernel > this % of GPU kernel time
 MEMCPY_HIGH_PCT = 10.0            # H2D + D2H > this % of GPU kernel time
 NO_AMP_MIN_COMPUTE_CAPABILITY = 7.0
 NO_AMP_FP32_SHARE_PCT = 50.0      # fp32/tf32 GEMM+conv time > this % of GEMM+conv time
+# Multi-rank runs (S3). Comm flags use the median rank; rank flags compare ranks.
+COMM_HEAVY_PCT = 30.0             # NCCL kernels > this % of GPU kernel time
+POOR_OVERLAP_PCT = 50.0           # < this % of comm time overlaps compute, while COMM_HEAVY
+RANK_STRAGGLER_RATIO = 1.10       # max/median busy (non-comm) GPU time per step across ranks
+RANK_IDLE_IMBALANCE_POINTS = 10.0  # max - min GPU idle % across ranks
+# Per-rank tables are included only up to this many ranks (spec §7.2).
+MAX_RANKS_IN_TABLES = 8
 
 # Config inference from trace contents (hta_llm/infer.py)
 INFER_HIGH_SHARE_PCT = 80.0       # dominant precision >= this % of GEMM/conv time -> high confidence
@@ -31,6 +38,9 @@ MAX_PROMPT_TOKENS = 24_000
 # optional bundle sections one by one; only then warn and send it anyway.
 BUDGET_TOP_N_STEPS = (10, 5)
 OPTIONAL_SECTIONS = ("launch stats", "category comparison", "kernel-name appendix")
+# Multi-rank bundles drop the all-ranks tables before OPTIONAL_SECTIONS. The rank aggregation
+# and the slowest rank's tables are never dropped: they are the bottleneck evidence.
+RANK_SECTIONS = ("all-ranks tables",)
 CHARS_PER_TOKEN = 2.5  # conservative: markdown tables and kernel names tokenize densely
                        # (a measured bundle prompt ran ~2.6 chars/token on Brine)
 

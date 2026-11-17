@@ -6,14 +6,16 @@
 
 import re
 from dataclasses import asdict
+from itertools import count
 
-from torch_trace_lab.hta_llm import tables
+from torch_trace_lab.hta_llm import settings, tables
 from torch_trace_lab.hta_llm.context import RunContext
 from torch_trace_lab.hta_llm.heuristics import Flag
-from torch_trace_lab.hta_llm.normalize import (CATEGORIES, RunMetrics, category_comparison,
-                                               kernel_comparison, step_time_differences)
+from torch_trace_lab.hta_llm.normalize import (CATEGORIES, RunMetrics, aggregate_ranks,
+                                               category_comparison, kernel_comparison,
+                                               step_time_differences)
 
-SCHEMA = "torch-lab-hta-bundle/2"
+SCHEMA = "torch-lab-hta-bundle/3"
 PATHLIKE = re.compile(r"(?:[A-Za-z]:)?(?:/[^/\s]+){2,}/")
 
 METRIC_FIELDS = [
@@ -23,14 +25,30 @@ METRIC_FIELDS = [
     "other_idle_pct_of_idle", "kernel_ms_per_step", "top_kernel", "top_kernel_pct", "memcpy_pct",
     "gemm_conv_precision_pct", "categories", "category_pct", "kernels_per_step",
     "median_kernel_us", "median_launch_cpu_us",
-    "median_launch_delay_us", "short_kernel_pct",
+    "median_launch_delay_us", "short_kernel_pct", "comm_ms_per_step", "comm_pct",
+    "exposed_comm_ms_per_step", "overlap_pct", "busy_ms_per_step",
 ]
+
+# Columns of the every-rank table, and labels for rank-comparison rows and columns.
+RANK_COLUMNS = ["rank", "step_time_ms", "busy_ms_per_step", "gpu_idle_pct",
+                "host_wait_ms_per_step", "comm_ms_per_step", "comm_pct",
+                "exposed_comm_ms_per_step", "overlap_pct"]
+METRIC_LABELS = {
+    "step_time_ms": "step time (ms)", "busy_ms_per_step": "busy GPU time (ms/step)",
+    "kernel_ms_per_step": "GPU kernel time (ms/step)", "gpu_idle_pct": "GPU idle %",
+    "idle_ms_per_step": "idle (ms/step)", "host_wait_ms_per_step": "host wait (ms/step)",
+    "comm_ms_per_step": "communication (ms/step)", "comm_pct": "communication % of GPU time",
+    "exposed_comm_ms_per_step": "exposed communication (ms/step)",
+    "overlap_pct": "comm overlapped with compute %",
+}
 
 DESCRIPTIONS = {
     "temporal": "How the GPU timeline splits into idle, compute kernels, and non-compute "
-                "(memory copy/set) kernels.",
+                "(memory copy/set and communication) kernels.",
     "idle": "Why the GPU was idle: host_wait = waiting for the CPU to launch work; "
-            "kernel_wait = short gaps between back-to-back kernels; other = anything else.",
+            "kernel_wait = short gaps between back-to-back kernels; other = anything else. "
+            "Shares are measured per CUDA stream (streams that only run communication are "
+            "left out); host wait in ms/step is its share of the GPU idle time.",
     "kernels": "GPU kernel time per step, first by category, then the top kernels by name "
                "(the rest are collapsed into '(remaining kernels)'). Categories line up across "
                "eager and torch.compile runs, whose kernel names differ; 'uncategorized' holds "
@@ -45,6 +63,17 @@ DESCRIPTIONS = {
     "differences": "Each cell is the column run's step time minus the row run's step time; "
                    "the % is relative to the row run. Negative means the column run is faster. "
                    "Quote these instead of subtracting step times.",
+    "ranks": "How the ranks of this run differ. For each metric: the lowest, median and "
+             "highest value across ranks, which rank holds the lowest and highest, and highest "
+             "÷ median. Busy GPU time is GPU kernel time minus communication: the work a rank "
+             "does itself. With synchronous collectives every rank's step ends together, so "
+             "a slow rank shows up as more busy time, and the other ranks as more "
+             "communication time (they wait inside the collective). The slowest rank is the "
+             "one with the most busy time.",
+    "comm": "Communication = NCCL collective kernels. Exposed communication runs while no "
+            "compute kernel runs, so it adds to the step; overlapped communication is hidden "
+            "behind compute. Waiting for a slower rank inside a collective counts as "
+            "communication.",
     "shared": "Kernels from any run's top list that occur in at least two runs. Values are "
               "each run's full ms/step for that kernel, even when it is outside that run's top "
               "list; '–' means the kernel does not occur in that run at all.",
@@ -58,16 +87,28 @@ def _strip_path(name: str) -> str:
 def build(*, scenario: str, metrics: list[RunMetrics], contexts: list[RunContext],
           flags: dict[str, list[Flag]], baseline: int, config_diff: list[dict],
           distinguishable: bool, data_quality: list[str], cluster: str | None,
-          kernel_names: dict[str, str], budget: dict | None = None) -> dict:
-    """``budget`` records how the bundle was shrunk to fit the prompt budget: top_n_used,
-    top_n_requested and dropped_sections (names from settings.OPTIONAL_SECTIONS)."""
+          kernel_names: dict[str, str], budget: dict | None = None,
+          ranks: dict[str, list[RunMetrics]] | None = None) -> dict:
+    """``metrics`` holds each run's representative (slowest) rank; ``ranks`` every rank's
+    metrics by run label. ``budget`` records how the bundle was shrunk to fit the prompt
+    budget: top_n_used, top_n_requested and dropped_sections (names from
+    settings.RANK_SECTIONS and settings.OPTIONAL_SECTIONS)."""
     budget = dict(budget or {})
     budget.setdefault("dropped_sections", [])
     dropped = set(budget["dropped_sections"])
     runs = []
     for m, c in zip(metrics, contexts):
+        per_rank = (ranks or {}).get(m.label) or [m]
+        multi = len(per_rank) > 1
+        every_rank = (multi and len(per_rank) <= settings.MAX_RANKS_IN_TABLES
+                      and "all-ranks tables" not in dropped)
         runs.append({
             "label": m.label,
+            "ranks_analyzed": len(per_rank),
+            "slowest_rank": m.rank if multi else None,
+            "rank_aggregate": aggregate_ranks(per_rank) if multi else [],
+            "ranks": ([{col: getattr(r, col) for col in RANK_COLUMNS} for r in per_rank]
+                      if every_rank else []),
             "facts": dict(c.facts),
             "config": {k: dict(v) for k, v in c.config.items()},
             "notes": c.notes,
@@ -152,10 +193,16 @@ def render_markdown(b: dict) -> str:
     labels = [r["label"] for r in runs]
     out = ["# Trace analysis bundle", ""]
 
-    out += ["## 1. Context", "",
-            f"- Scenario: {b['scenario']} "
-            + ("(single run, single GPU)" if b["scenario"] == "S1"
-               else f"(comparison of {len(runs)} single-GPU runs; baseline: {b['baseline']})")]
+    s3 = b["scenario"] == "S3"
+    slowest = f" (slowest rank: rank {runs[0]['slowest_rank']})" if s3 else ""
+    scenario = {
+        "S1": "(single run, single GPU)",
+        "S3": (f"(single run, {runs[0]['ranks_analyzed']} GPUs; the communication, temporal, "
+               f"idle, kernel and launch sections show the slowest rank, rank "
+               f"{runs[0]['slowest_rank']}; the rank comparison covers all ranks)"),
+    }.get(b["scenario"],
+          f"(comparison of {len(runs)} single-GPU runs; baseline: {b['baseline']})")
+    out += ["## 1. Context", "", f"- Scenario: {b['scenario']} {scenario}"]
     if b["cluster"]:
         out.append(f"- Cluster: {b['cluster']}")
     out.append("")
@@ -215,8 +262,10 @@ def render_markdown(b: dict) -> str:
         notes.append(f"To fit the prompt budget, {note}")
     for r in runs:
         steps = r["metrics"]["steps"]
-        notes.append(f"{r['label']}: {steps} profiler steps analyzed." if steps
-                     else f"{r['label']}: no profiler steps found; values are trace totals.")
+        who = r["label"] + (f" (rank {r['slowest_rank']})" if r["slowest_rank"] is not None
+                            else "")
+        notes.append(f"{who}: {steps} profiler steps analyzed." if steps
+                     else f"{who}: no profiler steps found; values are trace totals.")
         for name, reason in r["unavailable"].items():
             notes.append(f"{r['label']}: {name} analysis unavailable: {reason}")
     out += [f"- {n}" for n in notes] + [""]
@@ -236,18 +285,44 @@ def render_markdown(b: dict) -> str:
                               for r in runs], ["run", *[c for c, _ in cols]],
                              {c: h for c, h in cols})
 
-    out += ["## 4. Temporal breakdown", "", DESCRIPTIONS["temporal"], "",
+    section = count(4)
+
+    def heading(title: str) -> str:
+        return f"## {next(section)}. {title}"
+
+    if s3:
+        r = runs[0]
+        out += [heading("Rank comparison"), "", DESCRIPTIONS["ranks"], "",
+                tables.render([{"metric": METRIC_LABELS[row["metric"]],
+                                **{k: row[k] for k in ("min", "min_rank", "median", "max",
+                                                       "max_rank", "max_over_median")}}
+                               for row in r["rank_aggregate"]],
+                              ["metric", "min", "min_rank", "median", "max", "max_rank",
+                               "max_over_median"],
+                              {"min_rank": "rank (min)", "max_rank": "rank (max)",
+                               "max_over_median": "max ÷ median"}), ""]
+        if r["ranks"]:
+            out += ["### Every rank", "", tables.render(r["ranks"], RANK_COLUMNS, METRIC_LABELS),
+                    ""]
+        out += [heading("Communication" + slowest), "", DESCRIPTIONS["comm"], "",
+                metric_table([("comm_ms_per_step", "communication (ms/step)"),
+                              ("comm_pct", "communication % of GPU time"),
+                              ("exposed_comm_ms_per_step", "exposed (ms/step)"),
+                              ("overlap_pct", "overlapped with compute %"),
+                              ("busy_ms_per_step", "busy GPU time (ms/step)")]), ""]
+
+    out += [heading("Temporal breakdown" + slowest), "", DESCRIPTIONS["temporal"], "",
             metric_table([("step_time_ms", "step time (ms)"), ("gpu_idle_pct", "GPU idle %"),
                           ("gpu_compute_pct", "compute %"), ("gpu_non_compute_pct", "non-compute %"),
                           ("idle_ms_per_step", "idle (ms/step)"),
                           ("kernel_ms_per_step", "kernel time (ms/step)")]), ""]
-    out += ["## 5. Idle time breakdown", "", DESCRIPTIONS["idle"], "",
+    out += [heading("Idle time breakdown" + slowest), "", DESCRIPTIONS["idle"], "",
             metric_table([("host_wait_ms_per_step", "host wait (ms/step)"),
                           ("host_wait_pct_of_idle", "host wait % of idle"),
                           ("kernel_wait_pct_of_idle", "kernel wait % of idle"),
                           ("other_idle_pct_of_idle", "other % of idle")]), ""]
 
-    out += ["## 6. GPU kernel breakdown", "", DESCRIPTIONS["kernels"], ""]
+    out += [heading("GPU kernel breakdown" + slowest), "", DESCRIPTIONS["kernels"], ""]
     if b["category_comparison"]:
         out += [f"### Kernel time by category across runs (ms/step; Δ vs. {b['baseline']})", "",
                 tables.render(b["category_comparison"]), ""]
@@ -273,7 +348,8 @@ def render_markdown(b: dict) -> str:
                     f"{_fmt(r['metrics']['gemm_conv_precision_pct'])} (%).", ""]
 
     if "launch stats" not in dropped:
-        out += ["## 7. CUDA kernel launch stats", "", DESCRIPTIONS["launch"], "",
+        out += [heading("CUDA kernel launch stats" + slowest), "", DESCRIPTIONS["launch"],
+                "",
                 metric_table([("kernels_per_step", "kernels/step"),
                               ("median_kernel_us", "median kernel (µs)"),
                               ("median_launch_cpu_us", "median launch, CPU (µs)"),
@@ -281,7 +357,7 @@ def render_markdown(b: dict) -> str:
                               ("short_kernel_pct", "% kernels < 10 µs"),
                               ("memcpy_pct", "H2D+D2H % of GPU time")]), ""]
 
-    out += ["## 8. Derived metrics", "", DESCRIPTIONS["derived"], "",
+    out += [heading("Derived metrics"), "", DESCRIPTIONS["derived"], "",
             tables.render(b["derived"]), ""]
     if b["step_time_differences"]:
         diffs = {(d["from"], d["to"]): d for d in b["step_time_differences"]}

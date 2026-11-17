@@ -18,6 +18,7 @@ trace layout (file names don't matter):
   one run:       torch-lab analyze-traces my-run/          (or my-run/trace.json)
   compare runs:  torch-lab analyze-traces experiments/     (each subdirectory is a run)
                  torch-lab analyze-traces runA/ runB/ ...
+  multi-GPU run: torch-lab analyze-traces my-ddp-run/      (one trace file per rank)
   Each run directory holds the trace file(s) of one run, one file per rank.
 
 Only aggregated tables are sent to SHARCNET Brine, never raw traces. Keep sensitive
@@ -54,8 +55,9 @@ def add_parser(subparsers) -> None:
         description=(
             "Run Holistic Trace Analysis on PyTorch Profiler traces, compute rule-based "
             "performance flags, and ask an LLM on SHARCNET Brine for a ranked report. One run "
-            "answers 'how can I make this faster?'; several runs answer 'why do they differ?'. "
-            "Single-GPU runs only for now."),
+            "answers 'how can I make this faster?'; several runs answer 'why do they differ?'; "
+            "one multi-GPU run answers 'where are the distributed-training bottlenecks?'. "
+            "Comparing several multi-GPU runs is not supported yet."),
         epilog=LAYOUT,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

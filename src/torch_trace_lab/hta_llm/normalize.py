@@ -190,18 +190,27 @@ class RunMetrics:
     median_launch_delay_us: float | None = None
     short_kernel_pct: float | None = None
     samples_per_s: float | None = None
+    # Communication (NCCL) kernels. busy = GPU kernel time minus comm: the work a rank does
+    # itself, which is what makes a straggler (waiting in a collective counts as comm).
+    comm_ms_per_step: float | None = None
+    comm_pct: float | None = None                # of GPU kernel time
+    exposed_comm_ms_per_step: float | None = None  # comm with no compute kernel running
+    overlap_pct: float | None = None             # of comm time; None without comm
+    busy_ms_per_step: float | None = None
+    rank: int | None = None
     unavailable: dict[str, str] = field(default_factory=dict)
 
 
 def normalize_run(label: str, a: RunAnalysis, *, top_n: int = settings.TOP_N,
                   names: dict[str, str] | None = None,
-                  batch_size: int | None = None) -> RunMetrics:
-    """``names`` is the shared full->short mapping; missing names are added to it."""
+                  batch_size: int | None = None, rank: int | None = None) -> RunMetrics:
+    """One rank's metrics. ``names`` is the shared full->short mapping; missing names are
+    added to it."""
     names = {} if names is None else names
     steps = a.steps
     div = steps or 1  # without ProfilerStep annotations, report totals
     m = RunMetrics(label, steps, r2(a.step_time_us / 1000) if a.step_time_us else None,
-                   unavailable=dict(a.unavailable))
+                   rank=rank, unavailable=dict(a.unavailable))
 
     if a.temporal is not None and not a.temporal.empty:
         t = a.temporal.iloc[0]
@@ -213,7 +222,13 @@ def normalize_run(label: str, a: RunAnalysis, *, top_n: int = settings.TOP_N,
     if a.idle is not None and not a.idle.empty:
         ratios = dict(zip(a.idle["category"], a.idle["ratio"]))
         m.host_wait_pct_of_idle = r1(100 * ratios.get("host_wait", 0.0))
-        host_us = a.idle.loc[a.idle["category"] == "host_wait", "idle_us"].sum()
+        # Category shares come from HTA's per-stream breakdown; with several streams (e.g. a
+        # compute stream idle while NCCL runs on another) the per-stream sums exceed the
+        # GPU's idle time, so the ms value is the share of the GPU-wide idle time.
+        if a.temporal is not None and not a.temporal.empty:
+            host_us = ratios.get("host_wait", 0.0) * float(a.temporal.iloc[0]["idle_us"])
+        else:
+            host_us = a.idle.loc[a.idle["category"] == "host_wait", "idle_us"].sum()
         m.host_wait_ms_per_step = r2(host_us / div / 1000)
         m.kernel_wait_pct_of_idle = r1(100 * ratios.get("kernel_wait", 0.0))
         m.other_idle_pct_of_idle = r1(100 * ratios.get("other", 0.0))
@@ -259,6 +274,17 @@ def normalize_run(label: str, a: RunAnalysis, *, top_n: int = settings.TOP_N,
         m.categories = {c: r2(by_cat[c] / div / 1000) for c in CATEGORIES if c in by_cat.index}
         m.category_pct = {c: r1(100 * by_cat[c] / total) for c in CATEGORIES
                           if c in by_cat.index and total}
+        comm_us = float(k.loc[k["kernel_type"] == "COMMUNICATION", "sum_us"].sum())
+        m.comm_ms_per_step = r2(comm_us / div / 1000)
+        m.comm_pct = r1(100 * comm_us / total) if total else None
+        m.busy_ms_per_step = r2((total - comm_us) / div / 1000)
+
+    if a.comm and a.comm.get("comm_us"):
+        c = a.comm
+        m.exposed_comm_ms_per_step = r2((c["comm_us"] - c["overlapped_us"]) / div / 1000)
+        m.overlap_pct = r1(100 * c["overlapped_us"] / c["comm_us"])
+    elif a.comm is not None:
+        m.exposed_comm_ms_per_step = 0.0
 
     if a.launch is not None and not a.launch.empty:
         l = a.launch
@@ -272,6 +298,42 @@ def normalize_run(label: str, a: RunAnalysis, *, top_n: int = settings.TOP_N,
     if batch_size and m.step_time_ms:
         m.samples_per_s = r1(batch_size / (m.step_time_ms / 1000))
     return m
+
+
+# Per-rank metrics compared across ranks (spec §7.2), in table order.
+RANK_METRICS = ("step_time_ms", "busy_ms_per_step", "kernel_ms_per_step", "gpu_idle_pct",
+                "idle_ms_per_step", "host_wait_ms_per_step", "comm_ms_per_step", "comm_pct",
+                "exposed_comm_ms_per_step", "overlap_pct")
+
+
+def aggregate_ranks(ranks: list[RunMetrics]) -> list[dict]:
+    """For each metric in RANK_METRICS: min, median and max across ranks, which ranks hold
+    the min and max, and max/median. Metrics no rank has are left out."""
+    rows = []
+    for metric in RANK_METRICS:
+        values = [(r.rank, getattr(r, metric)) for r in ranks if getattr(r, metric) is not None]
+        if not values:
+            continue
+        lo = min(values, key=lambda rv: (rv[1], rv[0]))
+        hi = max(values, key=lambda rv: (rv[1], -rv[0]))
+        med = median(v for _, v in values)
+        rows.append({"metric": metric, "min": lo[1], "min_rank": lo[0], "median": r2(med),
+                     "max": hi[1], "max_rank": hi[0],
+                     "max_over_median": r2(hi[1] / med) if med else None})
+    return rows
+
+
+def slowest_rank(ranks: list[RunMetrics]) -> RunMetrics:
+    """The rank with the most busy (non-comm) GPU time per step; ties go to the lowest rank.
+
+    Not step time: with synchronous collectives every rank's step ends together, because
+    fast ranks wait inside NCCL. Falls back to step time, then to the first rank.
+    """
+    for metric in ("busy_ms_per_step", "step_time_ms"):
+        known = [r for r in ranks if getattr(r, metric) is not None]
+        if known:
+            return max(known, key=lambda r: (getattr(r, metric), -(r.rank or 0)))
+    return ranks[0]
 
 
 def kernel_comparison(runs: list[RunMetrics], baseline: int = 0) -> list[dict]:

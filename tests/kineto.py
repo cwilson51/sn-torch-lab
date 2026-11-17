@@ -38,10 +38,16 @@ def make_trace(
     python_functions: list[str] = (),
     device_properties=DEVICE_PROPERTIES,
     extra_events: list[dict] = (),
+    comm_kernels=(),
+    comm_overlap: bool = False,
 ) -> dict:
     """``extra_events`` are partial events (at least ``cat`` and ``name``, optionally ``args``);
     they are placed on the CPU thread in the first step, e.g. DataLoader annotations,
-    ``Torch-Compiled Region`` ops, ``cpu_op`` events with ``Input Dims``, ``cudaGraphLaunch``."""
+    ``Torch-Compiled Region`` ops, ``cpu_op`` events with ``Input Dims``, ``cudaGraphLaunch``.
+
+    ``comm_kernels`` are (name, µs) NCCL kernels run each step on their own stream (8):
+    with ``comm_overlap`` they start with the step's first compute kernel (as gradient
+    buckets do during the backward pass); otherwise they run after the compute kernels."""
     # Start with an unrelated CPU op, as real traces do: HTA links GPU events to their launch
     # by row index and treats index 0 as "no link".
     events = [{"ph": "X", "cat": "cpu_op", "name": "aten::empty", "pid": 100, "tid": 100,
@@ -62,6 +68,7 @@ def make_trace(
             gpu_t += memcpy_us
             cpu_t += launch_us
             corr += 1
+        compute_start = gpu_t
         for name, dur in kernels:
             events.append({"ph": "X", "cat": "cpu_op", "name": "aten::op", "pid": pid, "tid": tid,
                            "ts": cpu_t, "dur": launch_us, "args": {"External id": corr}})
@@ -75,6 +82,18 @@ def make_trace(
                 gpu_t = start + dur
             cpu_t += launch_us
             corr += 1
+        comm_t = compute_start + launch_us if comm_overlap else gpu_t
+        for name, dur in comm_kernels:
+            events.append(_runtime("cudaLaunchKernel", cpu_t, launch_us, corr, pid, tid))
+            if gpu:
+                events.append({"ph": "X", "cat": "kernel", "name": name, "pid": 0, "tid": 8,
+                               "ts": comm_t, "dur": dur,
+                               "args": {"device": 0, "stream": 8, "correlation": corr,
+                                        "External id": corr}})
+                comm_t += dur
+            cpu_t += launch_us
+            corr += 1
+        gpu_t = max(gpu_t, comm_t) if comm_kernels and gpu else gpu_t
         end = max(cpu_t, gpu_t) + gap_us
         if profiler_steps:
             events.append({"ph": "X", "cat": "user_annotation", "name": f"ProfilerStep#{step}",
@@ -115,6 +134,21 @@ def make_trace(
 def _runtime(name, ts, dur, corr, pid, tid):
     return {"ph": "X", "cat": "cuda_runtime", "name": name, "pid": pid, "tid": tid,
             "ts": ts, "dur": dur, "args": {"correlation": corr, "External id": corr}}
+
+
+ALLREDUCE = "ncclDevKernel_AllReduce_Sum_f32_RING_LL(ncclDevKernelArgsStorage<4096ul>)"
+
+
+def write_run(directory: Path, world_size: int, per_rank: dict[int, dict] | None = None,
+              **common) -> Path:
+    """One multi-rank run: a trace file per rank, named so the names mislead (rank ``r`` is
+    in ``trace-<world_size - 1 - r>.json``). ``per_rank`` overrides ``common`` kwargs."""
+    directory = Path(directory)
+    for rank in range(world_size):
+        kwargs = {**common, **(per_rank or {}).get(rank, {})}
+        write_trace(directory / f"trace-{world_size - 1 - rank}.json", rank=rank,
+                    world_size=world_size, **kwargs)
+    return directory
 
 
 def write_trace(path: Path, trace: dict | None = None, **kwargs) -> Path:

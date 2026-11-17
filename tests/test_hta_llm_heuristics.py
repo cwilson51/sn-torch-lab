@@ -2,7 +2,7 @@ from dataclasses import replace
 
 import pytest
 
-from kineto import write_trace
+from kineto import ALLREDUCE, write_run, write_trace
 from torch_trace_lab.hta_llm import analyses, heuristics, normalize
 from torch_trace_lab.hta_llm.normalize import RunMetrics
 
@@ -72,3 +72,60 @@ def test_flags_on_hta_fixtures(tmp_path):
     fast_ids = ids(normalize.normalize_run("fast", analyses.run_all(fast)))
     assert {"GPU_IDLE_HIGH", "HOST_BOUND", "NO_AMP_SUSPECTED"} <= set(slow_ids)
     assert fast_ids == []
+
+
+# --- Rank flags (M3) ----------------------------------------------------------------------
+
+CLEAN_RANK = replace(CLEAN, comm_ms_per_step=10.0, comm_pct=10.0, exposed_comm_ms_per_step=2.0,
+                     overlap_pct=80.0, busy_ms_per_step=87.0)
+
+
+def ranks(n=4, **changes):
+    """``n`` identical clean ranks; ``changes`` maps rank -> field overrides."""
+    return [replace(CLEAN_RANK, rank=r, **changes.get(f"r{r}", {})) for r in range(n)]
+
+
+def rank_ids(rs):
+    return [f.id for f in heuristics.rank_flags(rs)]
+
+
+def test_clean_ranks_have_no_rank_flags():
+    assert rank_ids(ranks()) == []
+    assert rank_ids(ranks(1)) == []
+    assert rank_ids([CLEAN]) == []  # a single-GPU run has no comm metrics
+
+
+@pytest.mark.parametrize("changes, expected", [
+    ({f"r{r}": {"comm_pct": 40.0} for r in range(4)}, ["COMM_HEAVY"]),
+    ({f"r{r}": {"comm_pct": 40.0, "overlap_pct": 20.0} for r in range(4)},
+     ["COMM_HEAVY", "POOR_OVERLAP"]),
+    ({f"r{r}": {"overlap_pct": 20.0} for r in range(4)}, []),  # poor overlap, light comm
+    ({"r2": {"busy_ms_per_step": 100.0}}, ["RANK_STRAGGLER"]),
+    ({"r2": {"busy_ms_per_step": 95.0}}, []),                 # 1.09x the median
+    ({"r3": {"gpu_idle_pct": 15.0}}, ["RANK_IDLE_IMBALANCE"]),
+    ({"r3": {"gpu_idle_pct": 13.0}}, []),                     # exactly 10 points apart
+    ({"r0": {"comm_pct": 40.0}}, []),                         # one comm-heavy rank, not the median
+])
+def test_each_rank_flag_fires_on_its_case(changes, expected):
+    assert rank_ids(ranks(**changes)) == expected
+
+
+def test_rank_flag_evidence_names_ranks():
+    rs = ranks(r2={"busy_ms_per_step": 130.0, "step_time_ms": 130.0},
+               r3={"gpu_idle_pct": 25.0})
+    flags = {f.id: f for f in heuristics.rank_flags(rs)}
+    straggler = flags["RANK_STRAGGLER"]
+    assert "rank 2 has 130.0 ms/step" in straggler.evidence and "1.49×" in straggler.evidence
+    assert "step time ranges 100.0–130.0 ms" in straggler.evidence
+    assert straggler.severity == "high"
+    assert "25.0% on rank 3 but 3.0% on rank 0" in flags["RANK_IDLE_IMBALANCE"].evidence
+
+
+def test_rank_flags_through_hta(tmp_path):
+    """End to end: rank 1 does 50% more compute; communication is serialized."""
+    write_run(tmp_path, 3, steps=5, gap_us=0, kernels=[("elementwise", 400)],
+              comm_kernels=[(ALLREDUCE, 300)],
+              per_rank={1: {"kernels": [("elementwise", 600)]}})
+    results = analyses.run_ranks(tmp_path)
+    rs = [normalize.normalize_run("r", a, rank=r) for r, a in results.items()]
+    assert set(rank_ids(rs)) == {"COMM_HEAVY", "POOR_OVERLAP", "RANK_STRAGGLER"}

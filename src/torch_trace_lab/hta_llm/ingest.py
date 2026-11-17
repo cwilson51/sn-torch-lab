@@ -18,6 +18,7 @@ Expected layout (all names are arbitrary):
   one run:       my-run/trace.json               (or a single trace file)
   several runs:  experiments/baseline/trace.json
                  experiments/bs128-amp/trace.json
+  multi-GPU run: my-ddp-run/a.json b.json c.json d.json   (one file per rank)
 Each run directory holds exactly one run; each trace file in it is one rank."""
 
 
@@ -49,6 +50,11 @@ class Run:
     @property
     def rank0(self) -> TraceInfo:
         return self.traces[0]
+
+    @property
+    def ranks(self) -> int:
+        """Number of rank trace files in the run (not the recorded world size)."""
+        return len(self.traces)
 
 
 def _is_trace_name(path: Path) -> bool:
@@ -164,8 +170,10 @@ def validate_ranks(label: str, traces: list[TraceInfo]) -> tuple[list[TraceInfo]
     if missing:
         raise IngestError(f"{label}/: incomplete run, ranks {missing} of world_size {world_size} "
                           "are missing.")
-    raise IngestError(f"{label}/: multi-GPU runs ({world_size} ranks) are not yet supported. "
-                      "Analyze one rank's trace file on its own for now.")
+    if len(ranks) != world_size:
+        raise IngestError(f"{label}/: ranks {sorted(ranks)} don't match world_size {world_size}. "
+                          f"{several_runs}")
+    return sorted(traces, key=lambda t: t.distributed["rank"]), []
 
 
 def check_content(label: str, traces: list[TraceInfo]) -> list[str]:
@@ -227,7 +235,12 @@ def ingest(paths: list[Path], stage_root: Path, environ=None) -> tuple[list[Run]
         traces, rank_warnings = validate_ranks(label, traces)
         warnings += rank_warnings
         warnings += check_content(label, traces)
-        run = Run(label, traces)
+        runs.append(Run(label, traces))
+    multi = [r.label for r in runs if r.ranks > 1]
+    if len(runs) > 1 and multi:
+        raise IngestError(f"Comparing multi-GPU runs is not yet supported ({', '.join(multi)} "
+                          f"{'has' if len(multi) == 1 else 'have'} several ranks). Analyze each "
+                          "multi-GPU run on its own: torch-lab analyze-traces <run-directory>.")
+    for run in runs:
         stage(run, stage_root)
-        runs.append(run)
     return runs, warnings

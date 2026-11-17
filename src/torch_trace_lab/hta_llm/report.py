@@ -32,6 +32,10 @@ def flags_only(bundle: dict, reason: str | None = None) -> str:
     for run in bundle["runs"]:
         out.append(f"## {run['label']}")
         out.append("")
+        if run.get("slowest_rank") is not None:
+            out += [f"{run['ranks_analyzed']} ranks analyzed. The slowest rank (most busy GPU "
+                    f"time per step) is rank {run['slowest_rank']}; flags marked with a rank "
+                    "come from its tables, the others compare all ranks.", ""]
         if not run["flags"]:
             out += ["No flags raised.", ""]
             continue
