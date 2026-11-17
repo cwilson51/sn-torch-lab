@@ -1,7 +1,9 @@
-"""M4 acceptance on real DDP traces (spec §14 M4).
+"""M4/M5 acceptance on real DDP traces (spec §14 M4, M5).
 
-The traces are not committed: they live in the repository's gitignored ``traces/`` directory
-(``traces/multi-gpu/<run>/``, one file per rank). Each test is skipped when its run is absent.
+The traces are not committed: they live in the repository's gitignored
+``demo/example-traces/`` directory (``multi-gpu/<run>/``, one file per rank, and
+``single-gpu/<config>/``), which the demo also uses. Each test is skipped when its run is
+absent.
 """
 
 import json
@@ -11,7 +13,8 @@ import pytest
 
 from torch_trace_lab import cli
 
-TRACES = Path(__file__).resolve().parents[1] / "traces"
+ROOT = Path(__file__).resolve().parents[1]
+TRACES = ROOT / "demo" / "example-traces"
 
 # run directory -> (num_nodes, gpus_per_node)
 DDP_RUNS = {"1_nodes_4_gpus": (1, 4), "2_nodes_4_gpus": (2, 2)}
@@ -19,7 +22,7 @@ DDP_RUNS = {"1_nodes_4_gpus": (1, 4), "2_nodes_4_gpus": (2, 2)}
 
 def _require(path: Path) -> Path:
     if not path.is_dir():
-        pytest.skip(f"real traces not present: {path.relative_to(TRACES.parent)}")
+        pytest.skip(f"real traces not present: {path.relative_to(ROOT)}")
     return path
 
 
@@ -49,7 +52,7 @@ def test_real_single_gpu_run_is_not_ddp(tmp_path):
     single = _require(TRACES / "single-gpu")
     runs = sorted(p for p in single.iterdir() if p.is_dir())
     if not runs:
-        pytest.skip("no single-GPU runs in traces/single-gpu")
+        pytest.skip(f"no single-GPU runs in {single.relative_to(ROOT)}")
     r = _analyze(runs[0], tmp_path)["runs"][0]
     assert "parallelism" not in r["config"]
     assert "num_nodes" not in r["config"]
