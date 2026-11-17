@@ -6,7 +6,7 @@ The GPU spends a large share of the step doing nothing. Look at the idle breakdo
 
 ## HOST_BOUND
 The GPU waits for the CPU, usually for data loading or Python overhead.
-- DataLoader: raise `num_workers` (start with the number of CPU cores allocated, e.g. `$SLURM_CPUS_PER_TASK`), set `persistent_workers=True` and `prefetch_factor=2..4`, and use `pin_memory=True`.
+- DataLoader: raise `num_workers` (start with the CPU cores available per GPU: `cpu_cores_per_gpu` in the run config if it is given, otherwise e.g. `$SLURM_CPUS_PER_TASK`), set `persistent_workers=True` and `prefetch_factor=2..4`, and use `pin_memory=True`.
 - Move expensive augmentation to the GPU (e.g. torchvision v2 transforms on GPU tensors, or NVIDIA DALI), or pre-process the dataset once.
 - On a cluster, copy the dataset to node-local storage (`$SLURM_TMPDIR`) at the start of the job instead of reading many small files from a shared filesystem.
 - Request more CPU cores per GPU in the Slurm job if the workers are CPU-starved.

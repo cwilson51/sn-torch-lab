@@ -63,6 +63,7 @@ SCHEMA = {
     "torch_compile": _bool,
     "num_nodes": _int(1),
     "gpus_per_node": _int(1),
+    "cpu_cores_per_gpu": _int(1),
     "parallelism": _choice("DDP", "FSDP", "DeepSpeed", "none"),
 }
 NESTED = {

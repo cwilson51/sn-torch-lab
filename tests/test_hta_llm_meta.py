@@ -3,7 +3,7 @@
 import pytest
 
 from torch_trace_lab.hta_llm.context import resolve_config, same_value
-from torch_trace_lab.hta_llm.meta import as_config, load_meta
+from torch_trace_lab.hta_llm.meta import as_config, key_list, load_meta
 
 LABELS = ["bs64-ddp", "bs64-fsdp"]
 
@@ -51,6 +51,14 @@ torch_compile = "yes"
         assert key in text
     # Warnings name keys, never values.
     assert "def-someprof" not in text and "/home/jdoe" not in text
+
+
+def test_cpu_cores_per_gpu(tmp_path):
+    path = write(tmp_path, 'cpu_cores_per_gpu = 8\n[runs."bs64-ddp"]\ncpu_cores_per_gpu = 0\n')
+    per_run, warnings = load_meta(path, LABELS)
+    assert per_run == {"bs64-ddp": {"cpu_cores_per_gpu": 8}, "bs64-fsdp": {"cpu_cores_per_gpu": 8}}
+    assert warnings == ['--meta: runs."bs64-ddp".cpu_cores_per_gpu has an invalid value; ignored.']
+    assert "`cpu_cores_per_gpu`" in key_list()
 
 
 def test_unknown_run_label_warns(tmp_path):

@@ -154,7 +154,7 @@ You can also pass a single trace file, or two or more run directories (`torch-la
    torch_compile = false
    ```
 
-   Other keys: `interconnect`, `num_nodes`, `gpus_per_node`, `parallelism` (`DDP`, `FSDP`, `DeepSpeed` or `none`), and `[ddp]`, `[fsdp]` and `[deepspeed]` tables for framework settings (e.g. `bucket_cap_mb`, `sharding_strategy`, `zero_stage`). Unknown keys and invalid values are ignored with a warning and are never sent.
+   Other keys: `interconnect`, `num_nodes`, `gpus_per_node`, `cpu_cores_per_gpu` (CPU cores available to each GPU's process, which bounds useful `num_workers`), `parallelism` (`DDP`, `FSDP`, `DeepSpeed` or `none`), and `[ddp]`, `[fsdp]` and `[deepspeed]` tables for framework settings (e.g. `bucket_cap_mb`, `sharding_strategy`, `zero_stage`). Unknown keys and invalid values are ignored with a warning and are never sent.
 
 If an inferred value disagrees with an embedded or `--meta` value, for example `--meta` says `fp32` but the kernels run in bf16, the given value is used. The disagreement is listed in the bundle's data-quality notes, and the report points it out: the run may not be configured the way you think.
 
