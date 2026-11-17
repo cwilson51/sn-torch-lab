@@ -25,5 +25,8 @@ brine-examples
 specs
 .env
 
+# Demo traces (kept outside git; tests that need them skip when absent)
+/traces
+
 # scripts/eval_models.py output
 /eval/

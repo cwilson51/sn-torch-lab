@@ -10,7 +10,11 @@ PERFETTO = ("Open the trace files in https://ui.perfetto.dev (or TensorBoard) to
 
 
 def prompt_file(name: str) -> str:
-    return (files("torch_trace_lab") / "hta_llm" / "prompts" / name).read_text()
+    """A file under hta_llm/prompts/; ``name`` may hold a subdirectory (``frameworks/ddp.md``)."""
+    path = files("torch_trace_lab") / "hta_llm" / "prompts"
+    for part in name.split("/"):
+        path = path / part
+    return path.read_text()
 
 
 def remediation_sections() -> dict[str, str]:

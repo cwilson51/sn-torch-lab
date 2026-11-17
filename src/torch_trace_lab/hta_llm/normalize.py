@@ -6,6 +6,7 @@ from statistics import median
 
 from torch_trace_lab.hta_llm import settings
 from torch_trace_lab.hta_llm.analyses import RunAnalysis
+from torch_trace_lab.hta_llm.frameworks import COLLECTIVES
 
 MEMCPY = re.compile(r"^Memcpy (HtoD|DtoH)")
 # Matrix-multiply and convolution kernels (cuBLAS, cuDNN, CUTLASS, Triton mm templates).
@@ -197,6 +198,11 @@ class RunMetrics:
     exposed_comm_ms_per_step: float | None = None  # comm with no compute kernel running
     overlap_pct: float | None = None             # of comm time; None without comm
     busy_ms_per_step: float | None = None
+    # NCCL time per collective type (frameworks.COLLECTIVES), and all-reduce with no compute
+    # kernel running. On a rank that waits for a slower one, both include the wait.
+    comm_by_collective_ms_per_step: dict[str, float] = field(default_factory=dict)
+    allreduce_ms_per_step: float | None = None
+    exposed_allreduce_ms_per_step: float | None = None
     rank: int | None = None
     unavailable: dict[str, str] = field(default_factory=dict)
 
@@ -285,6 +291,14 @@ def normalize_run(label: str, a: RunAnalysis, *, top_n: int = settings.TOP_N,
         m.overlap_pct = r1(100 * c["overlapped_us"] / c["comm_us"])
     elif a.comm is not None:
         m.exposed_comm_ms_per_step = 0.0
+    if a.comm and a.comm.get("by_collective"):
+        c = a.comm
+        m.comm_by_collective_ms_per_step = {k: r2(v / div / 1000)
+                                            for k, v in c["by_collective"].items()}
+        if c.get("allreduce_us"):
+            m.allreduce_ms_per_step = r2(c["allreduce_us"] / div / 1000)
+            m.exposed_allreduce_ms_per_step = r2(
+                (c["allreduce_us"] - c["allreduce_overlapped_us"]) / div / 1000)
 
     if a.launch is not None and not a.launch.empty:
         l = a.launch
@@ -303,7 +317,8 @@ def normalize_run(label: str, a: RunAnalysis, *, top_n: int = settings.TOP_N,
 # Per-rank metrics compared across ranks (spec §7.2), in table order.
 RANK_METRICS = ("step_time_ms", "busy_ms_per_step", "kernel_ms_per_step", "gpu_idle_pct",
                 "idle_ms_per_step", "host_wait_ms_per_step", "comm_ms_per_step", "comm_pct",
-                "exposed_comm_ms_per_step", "overlap_pct")
+                "exposed_comm_ms_per_step", "overlap_pct", "allreduce_ms_per_step",
+                "exposed_allreduce_ms_per_step")
 
 
 def aggregate_ranks(ranks: list[RunMetrics]) -> list[dict]:
@@ -320,6 +335,22 @@ def aggregate_ranks(ranks: list[RunMetrics]) -> list[dict]:
         rows.append({"metric": metric, "min": lo[1], "min_rank": lo[0], "median": r2(med),
                      "max": hi[1], "max_rank": hi[0],
                      "max_over_median": r2(hi[1] / med) if med else None})
+    return rows
+
+
+def collective_table(ranks: list[RunMetrics], per_rank: bool) -> list[dict]:
+    """Comm ms/step per collective type: min, median and max across ranks, and with
+    ``per_rank`` each rank's value too. Collectives no rank ran are left out."""
+    rows = []
+    for c in COLLECTIVES:
+        values = [r.comm_by_collective_ms_per_step.get(c, 0.0) for r in ranks]
+        if not any(c in r.comm_by_collective_ms_per_step for r in ranks):
+            continue
+        row = {"collective": c, "min": min(values), "median": r2(median(values)),
+               "max": max(values)}
+        if per_rank:
+            row.update({f"rank {r.rank}": v for r, v in zip(ranks, values)})
+        rows.append(row)
     return rows
 
 

@@ -56,7 +56,9 @@ def thresholds() -> dict[str, str]:
         "LAUNCH_BOUND": f"median kernel shorter than the median CPU launch, or > "
                         f"{s.LAUNCH_BOUND_SHORT_KERNEL_PCT:g}% of kernels < "
                         f"{s.LAUNCH_BOUND_SHORT_KERNEL_US:g} µs; with GPU idle "
-                        f"≥ {s.LAUNCH_BOUND_MIN_IDLE_PCT:g}%",
+                        f"≥ {s.LAUNCH_BOUND_MIN_IDLE_PCT:g}% and a median launch delay "
+                        f"≤ {s.LAUNCH_BOUND_MAX_DELAY_RATIO:g}× the median CPU launch "
+                        "(kernels start soon after launch)",
         "TOP_KERNEL_DOMINANT": f"one kernel > {s.TOP_KERNEL_DOMINANT_PCT:g}% of GPU kernel time",
         "MEMCPY_HIGH": f"host-to-device + device-to-host copies > {s.MEMCPY_HIGH_PCT:g}% of "
                        "GPU kernel time",
@@ -123,6 +125,13 @@ def launch_bound(m: RunMetrics) -> Flag | None:
     many_short = (m.short_kernel_pct or 0) > s.LAUNCH_BOUND_SHORT_KERNEL_PCT
     if not (faster_than_launch or many_short):
         return None
+    # A launch-bound GPU runs each kernel soon after it is launched. If kernels wait in the
+    # queue for much longer than a launch takes, the CPU is ahead of the GPU and the idle
+    # time has another cause (see HOST_BOUND).
+    if (m.median_launch_delay_us is not None and m.median_launch_cpu_us is not None
+            and m.median_launch_delay_us > s.LAUNCH_BOUND_MAX_DELAY_RATIO
+            * max(m.median_launch_cpu_us, 1.0)):
+        return None
     reasons = []
     if faster_than_launch:
         reasons.append(f"median kernel {m.median_kernel_us} µs < median CPU launch "
@@ -131,7 +140,9 @@ def launch_bound(m: RunMetrics) -> Flag | None:
         reasons.append(f"{m.short_kernel_pct}% of kernels < {s.LAUNCH_BOUND_SHORT_KERNEL_US:g} µs")
     return _flag("LAUNCH_BOUND", "high" if faster_than_launch and many_short else "medium",
                  "; ".join(reasons) + f"; {m.kernels_per_step} kernels/step; GPU idle "
-                 f"{m.gpu_idle_pct}%")
+                 f"{m.gpu_idle_pct}%"
+                 + (f"; median launch delay {m.median_launch_delay_us} µs"
+                    if m.median_launch_delay_us is not None else ""))
 
 
 def top_kernel_dominant(m: RunMetrics) -> Flag | None:

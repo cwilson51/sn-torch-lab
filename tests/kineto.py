@@ -40,6 +40,9 @@ def make_trace(
     extra_events: list[dict] = (),
     comm_kernels=(),
     comm_overlap: bool = False,
+    device: int = 0,
+    truncate_last_step: bool = False,
+    eventless_launches: int = 0,
 ) -> dict:
     """``extra_events`` are partial events (at least ``cat`` and ``name``, optionally ``args``);
     they are placed on the CPU thread in the first step, e.g. DataLoader annotations,
@@ -47,7 +50,13 @@ def make_trace(
 
     ``comm_kernels`` are (name, µs) NCCL kernels run each step on their own stream (8):
     with ``comm_overlap`` they start with the step's first compute kernel (as gradient
-    buckets do during the backward pass); otherwise they run after the compute kernels."""
+    buckets do during the backward pass); otherwise they run after the compute kernels.
+
+    ``device`` is the local GPU index in each GPU event's args (the rank's GPU on its node).
+    ``truncate_last_step`` leaves out the GPU event of the last step's last compute kernel,
+    as when a trace is exported before the GPU work of its final step is collected.
+    ``eventless_launches`` adds that many ``cudaMemsetAsync`` calls per step that never get a
+    GPU event, as zero-byte memsets in real compiled-model traces."""
     # Start with an unrelated CPU op, as real traces do: HTA links GPU events to their launch
     # by row index and treats index 0 as "no link".
     events = [{"ph": "X", "cat": "cpu_op", "name": "aten::empty", "pid": 100, "tid": 100,
@@ -64,22 +73,27 @@ def make_trace(
             if gpu:
                 events.append({"ph": "X", "cat": "gpu_memcpy", "name": "Memcpy HtoD (Pageable -> Device)",
                                "pid": 0, "tid": 7, "ts": gpu_t, "dur": memcpy_us,
-                               "args": {"device": 0, "stream": 7, "correlation": corr}})
+                               "args": {"device": device, "stream": 7, "correlation": corr}})
             gpu_t += memcpy_us
             cpu_t += launch_us
             corr += 1
         compute_start = gpu_t
-        for name, dur in kernels:
+        for k, (name, dur) in enumerate(kernels):
             events.append({"ph": "X", "cat": "cpu_op", "name": "aten::op", "pid": pid, "tid": tid,
                            "ts": cpu_t, "dur": launch_us, "args": {"External id": corr}})
             events.append(_runtime("cudaLaunchKernel", cpu_t, launch_us, corr, pid, tid))
-            if gpu:
+            cut = truncate_last_step and step == steps - 1 and k == len(kernels) - 1
+            if gpu and not cut:
                 start = max(gpu_t, cpu_t + launch_us)
                 events.append({"ph": "X", "cat": "kernel", "name": name, "pid": 0, "tid": 7,
                                "ts": start, "dur": dur,
-                               "args": {"device": 0, "stream": 7, "correlation": corr,
+                               "args": {"device": device, "stream": 7, "correlation": corr,
                                         "External id": corr}})
                 gpu_t = start + dur
+            cpu_t += launch_us
+            corr += 1
+        for _ in range(eventless_launches):
+            events.append(_runtime("cudaMemsetAsync", cpu_t, launch_us, corr, pid, tid))
             cpu_t += launch_us
             corr += 1
         comm_t = compute_start + launch_us if comm_overlap else gpu_t
@@ -88,7 +102,7 @@ def make_trace(
             if gpu:
                 events.append({"ph": "X", "cat": "kernel", "name": name, "pid": 0, "tid": 8,
                                "ts": comm_t, "dur": dur,
-                               "args": {"device": 0, "stream": 8, "correlation": corr,
+                               "args": {"device": device, "stream": 8, "correlation": corr,
                                         "External id": corr}})
                 comm_t += dur
             cpu_t += launch_us
@@ -106,7 +120,7 @@ def make_trace(
                 events.append({"ph": "X", "cat": "gpu_user_annotation",
                                "name": f"ProfilerStep#{step}", "pid": 0, "tid": 7,
                                "ts": first, "dur": gpu_t - first,
-                               "args": {"device": 0, "stream": 7, "External id": corr}})
+                               "args": {"device": device, "stream": 7, "External id": corr}})
         t = end
     for i, partial in enumerate(extra_events):
         events.append({"ph": "X", "pid": pid, "tid": tid, "ts": 1001 + i, "dur": 1, "args": {},
@@ -137,6 +151,13 @@ def _runtime(name, ts, dur, corr, pid, tid):
 
 
 ALLREDUCE = "ncclDevKernel_AllReduce_Sum_f32_RING_LL(ncclDevKernelArgsStorage<4096ul>)"
+BROADCAST = "ncclDevKernel_Broadcast_RING_LL(ncclDevKernelArgsStorage<4096ul>)"
+# DDP markers, as recorded in real DDP traces (torch 2.x).
+DDP_EVENTS = [
+    {"cat": "cpu_op", "name": "torch::distributed::reducer::mul_out"},
+    {"cat": "cpu_op", "name": "torch.distributed.ddp.reducer::copy_bucket_to_grad"},
+    {"cat": "user_annotation", "name": "DistributedDataParallel.forward"},
+]
 
 
 def write_run(directory: Path, world_size: int, per_rank: dict[int, dict] | None = None,

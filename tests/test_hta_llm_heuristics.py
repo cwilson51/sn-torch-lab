@@ -3,7 +3,7 @@ from dataclasses import replace
 import pytest
 
 from kineto import ALLREDUCE, write_run, write_trace
-from torch_trace_lab.hta_llm import analyses, heuristics, normalize
+from torch_trace_lab.hta_llm import analyses, heuristics, normalize, settings
 from torch_trace_lab.hta_llm.normalize import RunMetrics
 
 CLEAN = RunMetrics(
@@ -45,6 +45,24 @@ def test_host_bound_needs_real_idle():
 
 def test_launch_bound_needs_idle_gpu():
     assert "LAUNCH_BOUND" not in ids(replace(CLEAN, median_kernel_us=2.0, short_kernel_pct=90.0))
+
+
+LIMIT_US = settings.LAUNCH_BOUND_MAX_DELAY_RATIO * 6.0  # for a 6 µs median CPU launch
+
+
+@pytest.mark.parametrize("delay_us, fires", [
+    (5.0, True),             # kernels start right after launch
+    (LIMIT_US, True),
+    (LIMIT_US + 1, False),   # queued: the CPU is ahead of the GPU
+    (30_000.0, False),
+    (None, True),            # unknown: not ruled out
+])
+def test_launch_bound_needs_kernels_to_start_soon_after_launch(delay_us, fires):
+    """Short kernels with an idle GPU are launch bound only if kernels start soon after their
+    launch; kernels queued far longer than a launch takes mean the CPU is ahead."""
+    m = replace(CLEAN, gpu_idle_pct=15.0, median_kernel_us=1.0, short_kernel_pct=75.0,
+                median_launch_cpu_us=6.0, median_launch_delay_us=delay_us)
+    assert ("LAUNCH_BOUND" in ids(m)) is fires
 
 
 def test_no_amp_needs_tensor_cores():

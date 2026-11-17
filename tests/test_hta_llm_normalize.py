@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from kineto import ALLREDUCE, write_run, write_trace
+from kineto import ALLREDUCE, BROADCAST, write_run, write_trace
 from torch_trace_lab.hta_llm import analyses, normalize, tables
 from torch_trace_lab.hta_llm.analyses import RunAnalysis
 
@@ -189,7 +189,7 @@ def test_real_hta_on_fixture(tmp_path):
                 kernels=[("volta_sgemm_128x64_nn", 400), ("tiny", 3)])
     m = normalize.normalize_run("a", analyses.run_all(tmp_path))
     assert m.unavailable == {}
-    assert m.steps == 3  # HTA drops the last, partial step
+    assert m.steps == 4  # every step is complete, the last one too
     assert m.top_kernel == "volta_sgemm_128x64_nn"
     assert m.memcpy_pct and m.memcpy_pct > 10
     assert m.gpu_idle_pct is not None and m.host_wait_pct_of_idle == 100.0
@@ -202,7 +202,7 @@ def test_gpu_step_annotations_are_not_kernels_or_steps(tmp_path, gpu_annotations
                 kernels=[("volta_sgemm_128x64_nn", 400), ("elementwise", 100)])
     a = analyses.run_all(tmp_path)
     m = normalize.normalize_run("a", a)
-    assert a.steps in (8, 9)  # complete steps only; never doubled
+    assert a.steps == 10  # every step once; never doubled by the GPU-side annotations
     assert [k.short for k in m.kernels] == ["volta_sgemm_128x64_nn", "elementwise"]
     assert m.kernel_ms_per_step == 0.5           # 400 + 100 µs per step
     assert m.kernels[0].calls_per_step == 1.0
@@ -300,7 +300,58 @@ def test_unequal_step_counts_are_noted(tmp_path):
     from torch_trace_lab.hta_llm import pipeline
     write_run(tmp_path, 2, steps=5, per_rank={1: {"steps": 7}})
     results = analyses.run_ranks(tmp_path)
-    assert results[0].steps == 4 and results[1].steps == 6
+    assert results[0].steps == 5 and results[1].steps == 7
     note = pipeline.step_count_note("r", results)
-    assert note and "4 to 6" in note
+    assert note and "5 to 7" in note
     assert pipeline.step_count_note("r", {0: results[0]}) is None
+
+
+def test_sub_microsecond_kernels_are_counted(tmp_path):
+    """Kernels under 1 µs are recorded as 0 µs, so HTA's mean is 0; they must not make the
+    kernel breakdown unavailable (seen in real DDP traces)."""
+    write_trace(tmp_path / "t.json", steps=4,
+                kernels=[("volta_sgemm_128x64_nn", 400), ("zero", 0), ("zero", 0)])
+    a = analyses.run_all(tmp_path)
+    assert "kernels" not in a.unavailable
+    zero = a.kernels[a.kernels["name"] == "zero"].iloc[0]
+    assert zero["count"] == 8 and zero["sum_us"] == 0  # 2 per step, 4 steps
+
+
+def test_comm_by_collective_on_real_hta(tmp_path):
+    write_run(tmp_path, 2, steps=4, kernels=[("volta_sgemm_128x64_nn", 400)],
+              comm_kernels=[(ALLREDUCE, 200), (BROADCAST, 20)], comm_overlap=True)
+    ms = [normalize.normalize_run("r", a, rank=r)
+          for r, a in analyses.run_ranks(tmp_path).items()]
+    for m in ms:
+        assert m.comm_by_collective_ms_per_step == {"all-reduce": 0.2, "broadcast": 0.02}
+        assert m.allreduce_ms_per_step == 0.2
+        assert m.exposed_allreduce_ms_per_step == 0.0  # fully under the 400 µs GEMM
+    rows = normalize.collective_table(ms, per_rank=False)
+    assert rows == [{"collective": "all-reduce", "min": 0.2, "median": 0.2, "max": 0.2},
+                    {"collective": "broadcast", "min": 0.02, "median": 0.02, "max": 0.02}]
+
+
+def test_truncated_last_step_is_dropped(tmp_path):
+    """A last step whose GPU work wasn't collected (a launch without its GPU event) is left out,
+    on that rank only; complete last steps are kept."""
+    write_run(tmp_path, 2, steps=4, kernels=[("volta_sgemm_128x64_nn", 400), ("elementwise", 100)],
+              per_rank={1: {"truncate_last_step": True}})
+    results = analyses.run_ranks(tmp_path)
+    assert results[0].steps == 4 and results[1].steps == 3
+    ms = [normalize.normalize_run("r", a, rank=r) for r, a in results.items()]
+    assert all(m.kernel_ms_per_step == 0.5 for m in ms)  # per-step means use complete steps
+
+
+def test_few_steps_are_noted(tmp_path):
+    from torch_trace_lab.hta_llm import pipeline, settings
+    write_trace(tmp_path / "few" / "t.json", steps=settings.FEW_STEPS - 1)
+    write_trace(tmp_path / "enough" / "t.json", steps=settings.FEW_STEPS)
+    few = pipeline.few_steps_note("few", analyses.run_ranks(tmp_path / "few"))
+    assert few and f"only {settings.FEW_STEPS - 1} complete profiler steps" in few
+    assert pipeline.few_steps_note("enough", analyses.run_ranks(tmp_path / "enough")) is None
+
+
+@pytest.mark.parametrize("truncate, steps", [(False, 4), (True, 3)])
+def test_launches_that_never_get_gpu_events_dont_drop_the_last_step(tmp_path, truncate, steps):
+    write_trace(tmp_path / "t.json", steps=4, eventless_launches=2, truncate_last_step=truncate)
+    assert analyses.run_all(tmp_path).steps == steps
