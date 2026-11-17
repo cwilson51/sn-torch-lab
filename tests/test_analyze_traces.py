@@ -327,7 +327,8 @@ def test_budget_plan_shrinks_in_order():
         (15, ()), (10, ()), (5, ()),
         (5, ("launch stats",)),
         (5, ("launch stats", "category comparison")),
-        (5, ("launch stats", "category comparison", "kernel-name appendix")),
+        (5, ("launch stats", "category comparison", "trace diff")),
+        (5, ("launch stats", "category comparison", "trace diff", "kernel-name appendix")),
     ]
     assert pipeline.budget_plan(3)[0] == (3, ())
     assert all(n == 3 for n, _ in pipeline.budget_plan(3))
@@ -411,7 +412,8 @@ def test_s3_no_llm(ddp_run, tmp_path):
     out = tmp_path / "out"
     assert run(ddp_run, "--no-llm", "--output-dir", out) == 0
     b = json.loads((out / "bundle.json").read_text())
-    assert b["scenario"] == "S3" and b["schema"] == "torch-lab-hta-bundle/4"
+    assert b["scenario"] == "S3" and b["schema"] == "torch-lab-hta-bundle/5"
+    assert b["trace_diff"] == {} and b["diff_rank"] is None and b["rank_summary"] == []
     r = b["runs"][0]
     assert r["ranks_analyzed"] == 4 and r["slowest_rank"] == 2
     assert [row["rank"] for row in r["ranks"]] == [0, 1, 2, 3]
@@ -454,10 +456,153 @@ def test_s3_more_than_8_ranks_has_no_every_rank_table(tmp_path):
     assert "### Every rank" not in (out / "bundle.md").read_text()
 
 
-def test_comparing_multi_gpu_runs_exits_1(ddp_run, tmp_path, capsys):
-    write_trace(tmp_path / "single" / "t.json")
-    assert run(ddp_run, tmp_path / "single", "--no-llm", "--output-dir", tmp_path / "out") == 1
-    assert "Comparing multi-GPU runs is not yet supported" in capsys.readouterr().err
+@pytest.fixture
+def scaling_runs(tmp_path):
+    """S4: a 1-GPU baseline and a 4-GPU DDP run whose per-GPU step is slower (comm)."""
+    parent = tmp_path / "scaling"
+    lab = {"batch_size_per_gpu": 64}
+    write_trace(parent / "a-1gpu" / "t.json", steps=6, gap_us=50, torch_lab=lab,
+                kernels=[("volta_sgemm_128x64_nn", 400), ("elementwise", 100)])
+    write_run(parent / "b-4gpu", 4, steps=6, gap_us=50, torch_lab=lab,
+              kernels=[("volta_sgemm_128x64_nn", 400), ("elementwise", 100)],
+              comm_kernels=[(ALLREDUCE, 300)], extra_events=DDP_EVENTS,
+              per_rank={2: {"kernels": [("volta_sgemm_128x64_nn", 600), ("elementwise", 100),
+                                        ("extra_kernel_on_rank2", 50)]}})
+    return parent
+
+
+def _s4(scaling_runs, tmp_path, *args):
+    out = tmp_path / "out"
+    assert run(scaling_runs, "--no-llm", "--output-dir", out, *args) == 0
+    return (json.loads((out / "bundle.json").read_text()), (out / "bundle.md").read_text(),
+            (out / "prompt.md").read_text())
+
+
+def test_s4_no_llm(scaling_runs, tmp_path):
+    b, md, prompt = _s4(scaling_runs, tmp_path)
+    assert b["scenario"] == "S4" and b["schema"] == "torch-lab-hta-bundle/5"
+    assert [r["ranks_analyzed"] for r in b["runs"]] == [1, 4]
+    assert [row["run"] for row in b["rank_summary"]] == ["a-1gpu", "b-4gpu"]
+    assert b["rank_summary"][1]["slowest_rank"] == 2
+    assert b["collectives_by_run"][0]["collective"] == "all-reduce"
+    assert set(b["collectives_by_run"][0]) == {"collective", "b-4gpu min", "b-4gpu median"}
+    # Scaling: per-GPU throughput of the 4-GPU run vs. the 1-GPU baseline.
+    a, d = b["derived"]
+    assert (a["gpus"], d["gpus"]) == (1, 4)
+    assert a["scaling_efficiency_pct"] is None
+    assert d["scaling_basis"] == "per-GPU throughput"
+    assert d["scaling_efficiency_pct"] == round(
+        100 * d["samples_per_s_per_gpu"] / a["samples_per_s_per_gpu"], 1) < 80
+    assert "SCALING_INEFFICIENT" in {f["id"] for f in b["runs"][1]["flags"]}
+    assert d["samples_per_s_total"] and a["samples_per_s_total"] == a["samples_per_s_per_gpu"]
+    # Trace diff of rank 0 against the baseline's only rank.
+    td = b["trace_diff"]["b-4gpu"]
+    assert (b["diff_rank"], td["rank"], td["baseline_rank"]) == (0, 0, 0)
+    assert td["summary"]["GPU"]["added"] == 1  # the all-reduce kernel
+    assert any(r["change"] == "added" and r["device"] == "GPU" for r in td["rows"])
+    assert any(r["op"].startswith("torch::distributed::reducer") for r in td["rows"])
+    for heading in ["## 4. Rank comparison", "### b-4gpu (4 ranks)", "#### b-4gpu: every rank",
+                    "## 5. Communication (each multi-GPU run's slowest rank)",
+                    "### Communication by collective across runs",
+                    "Trace diff vs. a-1gpu (--diff-rank 0)",
+                    "### b-4gpu (rank 0) vs. a-1gpu (rank 0)", "scaling efficiency %"]:
+        assert heading in md
+    assert "on different GPU setups: a-1gpu (1 GPU), b-4gpu (4 GPUs)" in prompt
+    assert "**Scaling:**" in prompt and "parallelism = DDP" in prompt
+    # Runs' communication is compared on the median rank, never the slowest rank's.
+    assert "Don't compare runs' communication with this table" in md
+    assert "Never compare runs by the slowest rank's communication" in prompt
+    assert "{{" not in prompt and "<!--" not in prompt
+    assert "## SCALING_INEFFICIENT" in prompt and "## RANK_STRAGGLER" in prompt
+
+
+def test_s4_diff_rank_slowest_and_number(scaling_runs, tmp_path):
+    b, _, _ = _s4(scaling_runs, tmp_path, "--diff-rank", "slowest")
+    td = b["trace_diff"]["b-4gpu"]
+    assert (b["diff_rank"], td["rank"]) == ("slowest", 2)
+    assert any(r["op"] == "extra_kernel_on_rank2" and r["change"] == "added"
+               for r in td["rows"])
+    b, md, _ = _s4(scaling_runs, tmp_path, "--diff-rank", "3")
+    assert b["trace_diff"]["b-4gpu"]["rank"] == 3
+    assert "### b-4gpu (rank 3) vs. a-1gpu (rank 0)" in md
+
+
+def test_s4_diff_rank_missing_exits_1(scaling_runs, tmp_path, capsys):
+    assert run(scaling_runs, "--diff-rank", "4", "--no-llm", "--output-dir", tmp_path / "o") == 1
+    assert "--diff-rank 4: not every run has that rank (b-4gpu has ranks 0-3)" in \
+        capsys.readouterr().err
+
+
+def test_diff_rank_must_be_a_rank_or_slowest(scaling_runs, capsys):
+    with pytest.raises(SystemExit):
+        run(scaling_runs, "--diff-rank", "fastest")
+    assert "must be 'slowest' or a rank number" in capsys.readouterr().err
+
+
+def test_s2_has_trace_diff_and_no_scaling(two_runs, tmp_path):
+    out = tmp_path / "out"
+    assert run(two_runs, "--no-llm", "--output-dir", out) == 0
+    b = json.loads((out / "bundle.json").read_text())
+    assert b["scenario"] == "S2" and b["diff_rank"] == 0
+    td = b["trace_diff"]["serial"]  # amp is the baseline (sorted first)
+    assert td["rows"] and {r["device"] for r in td["rows"]} <= {"GPU", "CPU"}
+    assert all("scaling_efficiency_pct" not in r and "gpus" not in r for r in b["derived"])
+    md = (out / "bundle.md").read_text()
+    assert "Trace diff vs. amp\n" in md and "--diff-rank" not in md
+    prompt = (out / "prompt.md").read_text()
+    assert "## SCALING_INEFFICIENT" not in prompt and "## RANK_STRAGGLER" not in prompt
+
+
+def test_trace_diff_never_has_python_functions(tmp_path):
+    parent = tmp_path / "runs"
+    for name in ["a", "b"]:
+        write_trace(parent / name / "t.json", steps=3,
+                    python_functions=["/home/jdoe/proj/train.py(12): step"])
+    out = tmp_path / "out"
+    assert run(parent, "--no-llm", "--output-dir", out) == 0
+    rows = json.loads((out / "bundle.json").read_text())["trace_diff"]["b"]["rows"]
+    assert rows and not any("train.py" in r["op"] or "ProfilerStep" in r["op"]
+                            or r["op"].startswith("cuda") for r in rows)
+
+
+def test_trace_diff_failure_is_unavailable(two_runs, tmp_path, monkeypatch, capsys):
+    from torch_trace_lab.hta_llm import analyses
+
+    def boom(*a, **k):
+        raise RuntimeError("diff broke")
+    monkeypatch.setattr(analyses, "trace_diff", boom)
+    out = tmp_path / "out"
+    assert run(two_runs, "--no-llm", "--output-dir", out) == 0
+    b = json.loads((out / "bundle.json").read_text())
+    assert b["trace_diff"]["serial"]["unavailable"] == "RuntimeError: diff broke"
+    assert "Unavailable: RuntimeError: diff broke" in (out / "bundle.md").read_text()
+    assert "trace diff unavailable" in capsys.readouterr().err
+
+
+def test_s4_cross_framework_label(scaling_runs, tmp_path):
+    meta = tmp_path / "meta.toml"
+    meta.write_text('[runs."a-1gpu"]\nparallelism = "FSDP"\n')
+    b, md, prompt = _s4(scaling_runs, tmp_path, "--meta", meta)
+    assert b["comparison_kind"] == "cross-framework"
+    assert "**Cross-framework comparison:**" in md
+    assert "parallelism = DDP" in prompt and "a run uses FSDP" in prompt
+
+
+def test_s4_same_framework_label(scaling_runs, tmp_path):
+    b, md, _ = _s4(scaling_runs, tmp_path)
+    assert b["comparison_kind"] == "same framework"
+
+
+def test_s4_budget_keeps_rank_comparison_and_slowest_rank(scaling_runs, tmp_path,
+                                                           monkeypatch):
+    from torch_trace_lab.hta_llm import settings
+    monkeypatch.setattr(settings, "MAX_PROMPT_TOKENS", 10)
+    b, md, _ = _s4(scaling_runs, tmp_path)
+    assert b["budget"]["dropped_sections"] == [*settings.RANK_SECTIONS,
+                                               *settings.OPTIONAL_SECTIONS]
+    assert b["trace_diff"] == {} and b["runs"][1]["ranks"] == []
+    assert b["rank_summary"] and b["runs"][1]["rank_aggregate"] and b["runs"][1]["kernels"]
+    assert "## 4. Rank comparison" in md and "Trace diff" not in md
 
 
 def test_budget_plan_drops_all_ranks_tables_first():
@@ -465,7 +610,7 @@ def test_budget_plan_drops_all_ranks_tables_first():
     plan = pipeline.budget_plan(15, multi_rank=True)
     assert plan[:4] == [(15, ()), (10, ()), (5, ()), (5, ("all-ranks tables",))]
     assert plan[-1] == (5, ("all-ranks tables", "launch stats", "category comparison",
-                            "kernel-name appendix"))
+                            "trace diff", "kernel-name appendix"))
 
 
 def test_s3_budget_never_drops_rank_comparison_or_slowest_rank(ddp_run, tmp_path,

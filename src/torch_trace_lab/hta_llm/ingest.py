@@ -213,16 +213,20 @@ def clean_labels(labels: list[str], environ=None) -> tuple[list[str], list[str]]
 
 def stage(run: Run, root: Path) -> Path:
     """Symlink the run's validated trace files into their own directory for HTA."""
-    directory = root / f"run{len(list(root.iterdir())) + 1}"
+    run.staged_dir = stage_traces(run.traces, root / f"run{len(list(root.iterdir())) + 1}")
+    return run.staged_dir
+
+
+def stage_traces(traces: list[TraceInfo], directory: Path) -> Path:
+    """Symlink (or copy) the given trace files into a new directory of their own."""
     directory.mkdir()
-    for t in run.traces:
+    for t in traces:
         target = directory / t.path.name
         try:
             os.symlink(t.path.resolve(), target)
         except OSError:
             import shutil
             shutil.copy2(t.path, target)
-    run.staged_dir = directory
     return directory
 
 
@@ -236,11 +240,6 @@ def ingest(paths: list[Path], stage_root: Path, environ=None) -> tuple[list[Run]
         warnings += rank_warnings
         warnings += check_content(label, traces)
         runs.append(Run(label, traces))
-    multi = [r.label for r in runs if r.ranks > 1]
-    if len(runs) > 1 and multi:
-        raise IngestError(f"Comparing multi-GPU runs is not yet supported ({', '.join(multi)} "
-                          f"{'has' if len(multi) == 1 else 'have'} several ranks). Analyze each "
-                          "multi-GPU run on its own: torch-lab analyze-traces <run-directory>.")
     for run in runs:
         stage(run, stage_root)
     return runs, warnings

@@ -95,15 +95,25 @@ def test_ranks_beyond_world_size_are_an_error(tmp_path):
 
 
 @pytest.mark.parametrize("multi", [["a"], ["a", "b"]])
-def test_comparing_multi_gpu_runs_is_not_yet_supported(tmp_path, multi):
+def test_comparing_multi_gpu_runs_is_accepted(tmp_path, multi):
+    """S4 (M5): multi-GPU runs can be compared, also with single-GPU runs."""
     for label in ["a", "b"]:
         if label in multi:
             write_run(tmp_path / "exp" / label, 2)
         else:
             write_trace(tmp_path / "exp" / label / "t.json")
-    with pytest.raises(IngestError, match="Comparing multi-GPU runs is not yet supported"):
-        run_ingest(tmp_path, tmp_path / "exp")
-    assert not any((tmp_path / "_stage").iterdir())  # rejected before staging
+    runs, _ = run_ingest(tmp_path, tmp_path / "exp")
+    assert [(r.label, r.ranks) for r in runs] == [
+        (label, 2 if label in multi else 1) for label in ["a", "b"]]
+    assert all(r.staged_dir and len(list(r.staged_dir.iterdir())) == r.ranks for r in runs)
+
+
+def test_stage_traces_links_only_the_given_files(tmp_path):
+    run_dir = write_run(tmp_path / "r", 3)
+    runs, _ = run_ingest(tmp_path, run_dir)
+    target = ingest.stage_traces(runs[0].traces[2:3], tmp_path / "one")
+    files = list(target.iterdir())
+    assert len(files) == 1 and json.loads(files[0].read_text())["distributedInfo"]["rank"] == 2
 
 
 def test_misleading_filename_single_rank(tmp_path):

@@ -62,3 +62,10 @@ Some ranks' GPUs sit idle much more than others', usually because their CPU side
 - Give every rank the same number of DataLoader workers and enough CPU cores (`--cpus-per-task` per GPU in the Slurm job).
 - Copy the dataset to node-local storage (`$SLURM_TMPDIR`) on every node, so no rank reads from a slower shared filesystem.
 - Move rank-specific CPU work (logging, metric computation, checkpointing on rank 0) out of the step, or do it every N steps.
+
+## SCALING_INEFFICIENT
+Adding GPUs bought less extra throughput than expected: each GPU does less useful work per second than in the baseline run. The lost time is usually communication or waiting, so check COMM_HEAVY, POOR_OVERLAP, RANK_STRAGGLER and RANK_IDLE_IMBALANCE on the scaled run first, and compare its communication tables with the baseline's.
+- Give each GPU more work per step (a larger per-GPU batch, if memory allows), so the fixed communication cost per step is a smaller share.
+- Keep the job on as few nodes as fit: communication between nodes is much slower than within a node. Request whole nodes (`--gpus-per-node`) rather than GPUs spread across nodes.
+- Make communication overlap the backward pass (see POOR_OVERLAP), and communicate less often with gradient accumulation and the framework's no-sync option.
+- If per-GPU work also changed between the runs (different per-GPU batch size, precision or model), the efficiency compares unlike runs: check the config diff before acting on it.

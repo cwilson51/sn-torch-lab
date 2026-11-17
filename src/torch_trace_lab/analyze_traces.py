@@ -19,6 +19,7 @@ trace layout (file names don't matter):
   compare runs:  torch-lab analyze-traces experiments/     (each subdirectory is a run)
                  torch-lab analyze-traces runA/ runB/ ...
   multi-GPU run: torch-lab analyze-traces my-ddp-run/      (one trace file per rank)
+  compare multi-GPU runs: torch-lab analyze-traces scaling/   (ddp-4gpu/, ddp-8gpu/, ...)
   Each run directory holds the trace file(s) of one run, one file per rank.
 
 Only aggregated tables are sent to SHARCNET Brine, never raw traces. Keep sensitive
@@ -48,6 +49,19 @@ def positive_int(value: str) -> int:
     return n
 
 
+def diff_rank(value: str) -> int | str:
+    """--diff-rank: ``slowest`` or a rank number (0 or more)."""
+    if value == "slowest":
+        return value
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"must be 'slowest' or a rank number, not {value!r}")
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"must be 'slowest' or a rank number, not {n}")
+    return n
+
+
 def add_parser(subparsers) -> None:
     parser = subparsers.add_parser(
         "analyze-traces",
@@ -56,8 +70,8 @@ def add_parser(subparsers) -> None:
             "Run Holistic Trace Analysis on PyTorch Profiler traces, compute rule-based "
             "performance flags, and ask an LLM on SHARCNET Brine for a ranked report. One run "
             "answers 'how can I make this faster?'; several runs answer 'why do they differ?'; "
-            "one multi-GPU run answers 'where are the distributed-training bottlenecks?'. "
-            "Comparing several multi-GPU runs is not supported yet."),
+            "one multi-GPU run answers 'where are the distributed-training bottlenecks?'; "
+            "several runs on different GPU setups also get scaling efficiency."),
         epilog=LAYOUT,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -75,6 +89,11 @@ def add_parser(subparsers) -> None:
                              "Sent to Brine: no sensitive information.")
     parser.add_argument("--baseline", metavar="LABEL",
                         help="Baseline run for comparisons (default: the first run).")
+    parser.add_argument("--diff-rank", type=diff_rank, default=0, metavar="{0,slowest,N}",
+                        help="Comparisons: the rank of each multi-GPU run whose trace is "
+                             "diffed against the baseline's: a rank number (default 0), or "
+                             "'slowest' (each run's rank with the most busy GPU time). "
+                             "Single-GPU runs always use their only rank.")
     parser.add_argument("--top-n", type=positive_int, default=settings.TOP_N,
                         help=f"Kernels per table (default: {settings.TOP_N}).")
     parser.add_argument("--model", help="Brine model (default: $TORCH_LAB_BRINE_MODEL, "
@@ -106,7 +125,8 @@ def run(args) -> int:
 
     opts = pipeline.Options(paths=args.paths, output_dir=args.output_dir,
                             run_notes=args.run_note, baseline=args.baseline, top_n=args.top_n,
-                            model=args.model, no_llm=args.no_llm, meta=args.meta)
+                            model=args.model, no_llm=args.no_llm, meta=args.meta,
+                            diff_rank=args.diff_rank)
     try:
         return pipeline.run(opts)
     except KeyboardInterrupt:

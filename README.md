@@ -97,7 +97,7 @@ torch-lab generate-example-traces --time 0-01:00:00 --gpus h100:1   # change the
 torch-lab analyze-traces ./traces/single-gpu
 ```
 
-`analyze-traces` runs [Holistic Trace Analysis](https://github.com/facebookresearch/HolisticTraceAnalysis) on PyTorch Profiler traces, computes rule-based performance flags, and asks an LLM on [SHARCNET Brine](https://brine.sharcnet.ca) for a ranked, actionable report. With one run it answers "how can I make this faster?"; with several runs it answers "why do they differ, and how does the bottleneck mix shift?"; with one multi-GPU run it answers "where are the distributed-training bottlenecks?". Comparing several multi-GPU runs is not supported yet: analyze each one on its own.
+`analyze-traces` runs [Holistic Trace Analysis](https://github.com/facebookresearch/HolisticTraceAnalysis) on PyTorch Profiler traces, computes rule-based performance flags, and asks an LLM on [SHARCNET Brine](https://brine.sharcnet.ca) for a ranked, actionable report. With one run it answers "how can I make this faster?"; with several runs it answers "why do they differ, and how does the bottleneck mix shift?"; with one multi-GPU run it answers "where are the distributed-training bottlenecks?"; with several runs on different GPU setups it also explains how well the extra GPUs pay off (see **Comparing multi-GPU runs**).
 
 **Trace layout.** File names don't matter; the structure comes from directories:
 
@@ -127,6 +127,18 @@ torch-lab analyze-traces ./traces/multi-gpu/1_nodes_4_gpus
 torch-lab analyze-traces ./traces/multi-gpu/2_nodes_4_gpus
 ```
 
+**Comparing runs: the trace diff.** Every comparison includes a trace diff of each run against the baseline, made with HTA's `TraceDiff`. It shows which GPU kernels and PyTorch operators were added or removed, and which changed in time or calls per step, largest change first, over each run's complete profiler steps. It uses one rank per run: for a multi-GPU run, rank 0 by default, or the rank set with `--diff-rank` (`slowest` picks each run's slowest rank). A single-GPU run always uses its only rank.
+
+**Comparing multi-GPU runs.** Multi-GPU runs can be compared with each other and with single-GPU runs, e.g. `torch-lab analyze-traces scaling/` with `scaling/1gpu/`, `scaling/ddp-4gpu/` and `scaling/ddp-8gpu/`. The bundle then adds:
+
+- a rank comparison with one row per run (slowest rank, busy-time imbalance, step-time range, and the median rank's communication share and overlap), followed by each run's full rank comparison;
+- communication per run, and time per collective type aligned across runs (the lowest and median rank of each run);
+- per-GPU and total throughput, and for each run on a different number of GPUs than the baseline, the **scaling efficiency**. This is weak scaling: the run's samples/s per GPU ÷ the baseline's, so 100% means every added GPU is as productive as in the baseline. It needs the batch size (embedded, `--meta`, or inferred); without one it falls back to the baseline's step time ÷ the run's, which assumes the same per-GPU batch size. When the per-GPU batch sizes differ, the bundle says so, since the efficiency then also reflects the batch-size change;
+- the flag `SCALING_INEFFICIENT`, raised when scaling efficiency is below 80%;
+- a note when the runs use different distributed frameworks (a cross-framework comparison).
+
+The demo's two DDP runs (same GPU count, different node layout) are compared with `torch-lab analyze-traces ./traces/multi-gpu`. A single-GPU demo run against a DDP run shows scaling efficiency, e.g. `torch-lab analyze-traces ./traces/single-gpu/threaded-compiled ./traces/multi-gpu/1_nodes_4_gpus`.
+
 **Outputs** (in `./hta-report`, change with `--output-dir`):
 
 - `report.md`: the LLM report, or a flags-only report with `--no-llm` or when Brine can't be used;
@@ -141,6 +153,7 @@ torch-lab analyze-traces ./traces/multi-gpu/2_nodes_4_gpus
 | `--run-note [LABEL=]TEXT` | Free-text context for a run, e.g. `--run-note baseline="bs 64, 8 workers"`. Repeatable. For a single run, the label can be left out. |
 | `--meta FILE.toml` | Structured run metadata (see **Run config** below). |
 | `--baseline LABEL` | Baseline run for comparisons (default: the first run). |
+| `--diff-rank {0,slowest,N}` | Comparisons: which rank of each multi-GPU run the trace diff uses (default: 0). `slowest` picks each run's rank with the most busy GPU time. Rank N must exist in every multi-GPU run. |
 | `--top-n N` | Kernels per table (default: 15). If the prompt would be too large, fewer are shown (see **Prompt size**). |
 | `--model NAME` | Brine model (default: `$TORCH_LAB_BRINE_MODEL`, `$BRINE_MODEL`, or `DeepSeek-V4-Flash-0731`). |
 | `--no-llm` | Write the bundle, prompt, and a flags-only report without calling Brine. |
@@ -177,7 +190,7 @@ torch-lab analyze-traces ./traces/multi-gpu/2_nodes_4_gpus
 
 If an inferred value disagrees with an embedded or `--meta` value, for example `--meta` says `fp32` but the kernels run in bf16, the given value is used. The disagreement is listed in the bundle's data-quality notes, and the report points it out: the run may not be configured the way you think.
 
-**Prompt size.** If the prompt would exceed about 24,000 tokens (for example with many runs), it is shrunk step by step until it fits. The kernel tables first drop to the top 10, then the top 5 kernels. After that, for a multi-GPU run, the every-rank table is left out; then the launch stats, the per-category comparison and the kernel-name appendix, in that order. The rank comparison and the slowest rank's tables are always kept. Flags are always computed from the full data. The bundle's data-quality notes say what was left out.
+**Prompt size.** If the prompt would exceed about 24,000 tokens (for example with many runs), it is shrunk step by step until it fits. The kernel tables first drop to the top 10, then the top 5 kernels. After that, for a multi-GPU run, the every-rank table is left out; then the launch stats, the per-category comparison, the trace diff and the kernel-name appendix, in that order. The trace diff shows as many rows as the kernel tables. The rank comparison and the slowest rank's tables are always kept. Flags are always computed from the full data. The bundle's data-quality notes say what was left out.
 
 **Brine settings.** Set the Brine endpoint and your own API key before running without `--no-llm`:
 

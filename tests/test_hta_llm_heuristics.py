@@ -147,3 +147,15 @@ def test_rank_flags_through_hta(tmp_path):
     results = analyses.run_ranks(tmp_path)
     rs = [normalize.normalize_run("r", a, rank=r) for r, a in results.items()]
     assert set(rank_ids(rs)) == {"COMM_HEAVY", "POOR_OVERLAP", "RANK_STRAGGLER"}
+
+
+def test_scaling_inefficient():
+    f = heuristics.scaling_inefficient(62.5, "per-GPU throughput", 4, "base", 1)
+    assert f.id == "SCALING_INEFFICIENT" and f.severity == "medium"
+    assert "62.5% on 4 GPUs vs. base on 1 GPU, by per-GPU throughput" in f.evidence
+    assert heuristics.scaling_inefficient(40.0, "x", 8, "b", 4).severity == "high"
+    assert heuristics.scaling_inefficient(75.0, "x", 8, "b", 4).severity == "low"
+    assert heuristics.scaling_inefficient(settings.SCALING_EFFICIENCY_MIN_PCT, "x", 8, "b",
+                                          4) is None
+    assert heuristics.scaling_inefficient(None, None, 8, "b", 4) is None
+    assert "SCALING_INEFFICIENT" in heuristics.describe_flags()
