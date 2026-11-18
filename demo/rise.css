@@ -1,6 +1,36 @@
+/*
+ * Slideshow styles for the RISE notebooks in this directory (demo.ipynb).
+ *
+ * RISE runs at width/height 100%, so Reveal never scales the slides: text
+ * renders at JupyterLab's notebook size (~14px) unless we size it here.
+ * Everything is sized from one base font in vmin, so slides look the same
+ * on a laptop and on a projector. Every rule is scoped to .reveal, so the
+ * notebook looks normal when you are not presenting.
+ *
+ * Markdown authoring conventions:
+ *   # Title          slide title
+ *   ## Subtitle      section label / short heading
+ *   plain text       body text (already slide-sized, no ## needed)
+ *   - item           bullet; indent two spaces for a sub-bullet
+ *   <div class="title-slide">    title slide (title-bg.svg)
+ *   <div class="pt-slide">       slide with the PyTorch logo (pt-content-bg.svg)
+ *   <div class="section-slide">  big centred divider slide
+ *   <p class="note">             smaller, muted aside
+ */
+
+:root {
+  --slide-base: 3.1vmin;        /* body text: ~33px on a 1080p screen */
+  --slide-code: 2.2vmin;          /* code cells and code blocks */
+  --sn-blue: #2b5cb4;
+  --sn-gold: #e6a300;
+  --slide-ink: #1f2328;
+  --slide-muted: #5b6370;
+}
+
+/* ---------- Backgrounds (unchanged from rise.css) ---------- */
+
 .reveal { background: url("images/content-bg.svg") center / 100% 100% no-repeat; }
 
-/* Full-screen background when the current slide contains .content-slide */
 .reveal:has(section.present:not(.stack) .title-slide) {
   background: url("images/title-bg.svg") center / 100% 100% no-repeat;
 }
@@ -17,14 +47,6 @@
   bottom: 10px;
 }
 
-ul.big > li {
-  font-size: 1.5em;   /* typical h2 size */
-  font-weight: bold;
-}
-ul.big > li::marker {
-  font-size: 1em;     /* marker inherits li size; adjust if needed */
-}
-
 .reveal .slides,
 .reveal .slides section,
 .reveal .jp-Notebook,
@@ -35,4 +57,177 @@ ul.big > li::marker {
 .reveal .jp-RenderedHTMLCommon,
 .reveal .jp-OutputArea-output {
   background: transparent !important;
+}
+
+/* ---------- Slide frame ---------- */
+
+/* Keep content clear of the screen edges and of the SHARCNET logo
+   in the bottom-left corner (~86-95% of the height). */
+/* Pad only the slide that holds content. A vertical stack (.stack) wraps
+   its subslides, and each subslide is 100% wide: padding the stack too
+   would shift every subslide right and push it off the screen. */
+.reveal .slides section.stack { padding: 0 !important; }
+.reveal .slides section:not(.stack) {
+  box-sizing: border-box;
+  padding: 5vh 5vw 13vh !important;
+}
+
+/* Hide the active-cell bar on markdown cells; it reads as a stray
+   vertical line on text slides. Code cells keep it so you can see
+   which cell Shift-Enter will run. */
+.reveal .jp-MarkdownCell .jp-Collapser { visibility: hidden; }
+
+/* Hide the prompt gutter ("[12]:") on markdown cells so text lines up
+   with the slide edge; code cells keep theirs. */
+.reveal .jp-MarkdownCell .jp-InputPrompt { display: none; }
+
+/* ---------- Typography ---------- */
+
+.reveal .jp-RenderedMarkdown.jp-RenderedHTMLCommon {
+  font-size: var(--slide-base);
+  line-height: 1.35;
+  color: var(--slide-ink);
+  padding-right: 0;
+}
+
+.reveal .jp-RenderedHTMLCommon :is(h1, h2, h3) {
+  font-family: inherit;
+  color: var(--slide-ink);
+  line-height: 1.15;
+  margin: 0 0 0.5em;
+  text-transform: none;
+}
+
+/* Slide title with a short gold rule underneath */
+.reveal .jp-RenderedHTMLCommon h1 {
+  font-size: 1.75em;
+  font-weight: 700;
+  padding-bottom: 0.25em;
+  border-bottom: none;
+  background: linear-gradient(var(--sn-gold), var(--sn-gold)) left bottom / 3em 0.12em no-repeat;
+  margin-bottom: 0.7em;
+}
+
+.reveal .jp-RenderedHTMLCommon h2 {
+  font-size: 1.3em;
+  font-weight: 600;
+  color: var(--sn-blue);
+}
+
+.reveal .jp-RenderedHTMLCommon h3 {
+  font-size: 1.1em;
+  font-weight: 600;
+}
+
+.reveal .jp-RenderedHTMLCommon p { margin: 0 0 0.6em; }
+
+/* Heading anchor links (¶) are noise on a slide */
+.reveal .jp-InternalAnchorLink { display: none !important; }
+
+/* ---------- Lists ---------- */
+
+.reveal .jp-RenderedHTMLCommon :is(ul, ol) {
+  margin: 0 0 0.6em;
+  padding-left: 1.3em;
+}
+
+.reveal .jp-RenderedHTMLCommon li {
+  margin: 0 0 0.45em;
+  padding-left: 0.2em;
+}
+
+.reveal .jp-RenderedHTMLCommon li::marker { color: var(--sn-blue); }
+
+/* Sub-bullets: a step smaller, tighter, muted */
+.reveal .jp-RenderedHTMLCommon li :is(ul, ol) {
+  font-size: 0.82em;
+  margin: 0.3em 0 0.2em;
+  color: var(--slide-muted);
+}
+.reveal .jp-RenderedHTMLCommon li li { margin-bottom: 0.25em; }
+.reveal .jp-RenderedHTMLCommon li li::marker { color: var(--sn-gold); }
+
+/* ---------- Code ---------- */
+
+.reveal .jp-RenderedHTMLCommon :not(pre) > code {
+  font-size: 0.85em;
+  margin: 0;
+  padding: 0.05em 0.25em;
+  border-radius: 4px;
+  background: rgba(43, 92, 180, 0.08);
+}
+
+.reveal .jp-RenderedHTMLCommon pre {
+  font-size: var(--slide-code);
+  line-height: 1.4;
+  padding: 0.7em 1em;
+  margin: 0.3em 0 0.9em;
+  border-left: 4px solid var(--sn-blue);
+  border-radius: 4px;
+  background: rgba(240, 243, 248, 0.9);
+  overflow-x: auto;
+}
+.reveal .jp-RenderedHTMLCommon pre code { background: none; padding: 0; font-size: 1em; }
+
+/* Wide preformatted tables (profiler output pasted into markdown) */
+.reveal .jp-RenderedHTMLCommon .wide pre { font-size: calc(var(--slide-code) * 0.8); }
+
+/* Live code cells: readable from the back of the room */
+.reveal .jp-CodeCell .cm-editor .cm-content,
+.reveal .jp-CodeCell .cm-editor .cm-gutters {
+  font-size: var(--slide-code);
+  line-height: 1.4;
+}
+
+/* Wrap long code lines instead of letting them run off the slide; the
+   hanging indent keeps wrapped continuations visibly indented. */
+.reveal .jp-CodeCell .cm-editor .cm-content {
+  white-space: pre-wrap !important;
+  overflow-wrap: anywhere !important;
+  flex-shrink: 1 !important;
+  width: 100%;
+}
+.reveal .jp-CodeCell .cm-editor .cm-line {
+  padding-left: 2em !important;
+  text-indent: -2em;
+}
+
+/* ---------- Special slide layouts ---------- */
+
+/* Title slide: text sits top-left, clear of the swoosh on the right */
+.reveal .title-slide {
+  max-width: 52%;
+  padding-top: 6vh;
+}
+.reveal .title-slide h1 {
+  font-size: 2.1em;
+  background: none;
+  padding-bottom: 0;
+  margin-bottom: 0.4em;
+}
+.reveal .title-slide h2 {
+  font-size: 1.15em;
+  font-weight: 500;
+  line-height: 1.3;
+  color: var(--slide-muted);
+  margin-bottom: 1.6em;
+}
+.reveal .title-slide .author {
+  font-size: 1.05em;
+  font-weight: 600;
+  color: var(--sn-blue);
+}
+
+/* PyTorch-logo slide: keep text left of the logo (logo is at ~61-93% width) */
+.reveal .pt-slide { max-width: 56%; }
+
+/* Section divider: large title, pushed down from the top */
+.reveal .section-slide { padding-top: 18vh; }
+.reveal .section-slide h1 { font-size: 2.3em; }
+.reveal .section-slide h2 { font-size: 1.4em; color: var(--slide-muted); font-weight: 500; }
+
+/* Small aside */
+.reveal .jp-RenderedHTMLCommon .note {
+  font-size: 0.8em;
+  color: var(--slide-muted);
 }

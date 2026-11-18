@@ -28,6 +28,10 @@ specs
 # Demo traces (kept outside git; tests that need them skip when absent)
 /traces
 /demo/example-traces
+/demo/hta-report/
 
 # scripts/eval_models.py output
 /eval/
+
+# Archived demo notebook/stylesheet (old versions live in git history)
+demo/*_archive.*
