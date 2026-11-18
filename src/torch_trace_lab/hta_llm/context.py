@@ -19,6 +19,7 @@ TORCH_LAB_KEYS = {
     "model": str,
     "batch_size_per_gpu": int,
     "dataloader_workers": int,
+    "pin_memory": bool,
     "torch_compile": bool,
     "precision": str,
     "torch_version": str,

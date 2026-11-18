@@ -97,16 +97,25 @@ def test_cancel_at_prompt(monkeypatch, calls, tmp_path, capsys, exc):
 def test_workers_from_slurm_cpus(monkeypatch, tmp_path):
     monkeypatch.setenv("SLURM_CPUS_PER_TASK", "6")
     runs = dict(et.trace_runs(64, tmp_path))
-    assert runs["Main process"][-1] == "0"
-    assert runs["Serial"][-1] == "1"
-    for name in ["Threaded", "Threaded, compiled", "Threaded, compiled, AMP"]:
+    def workers(name):
         args = runs[name]
-        assert args[args.index("--nWorkers") + 1] == "6"
+        return args[args.index("--nWorkers") + 1]
+
+    assert workers("Main process") == "0"
+    assert workers("Serial") == workers("Serial, compiled") == "1"
+    for name in ["Threaded, compiled", "Threaded, compiled, AMP"]:
+        assert workers(name) == "6"
+
+
+def test_pin_memory_in_every_run_but_main_process(tmp_path):
+    runs = dict(et.trace_runs(64, tmp_path))
+    assert "--pin_memory" not in runs.pop("Main process")
+    assert all("--pin_memory" in args for args in runs.values())
 
 
 def test_workers_default_without_slurm(monkeypatch, tmp_path):
     monkeypatch.setattr(et.os, "cpu_count", lambda: 16)
-    args = dict(et.trace_runs(64, tmp_path))["Threaded"]
+    args = dict(et.trace_runs(64, tmp_path))["Threaded, compiled"]
     assert args[args.index("--nWorkers") + 1] == "4"
 
 
@@ -180,12 +189,12 @@ def test_invalid_batch_size(value, capsys):
 
 
 def test_default_output_dir_is_single_gpu():
-    assert cli.build_parser().parse_args([CMD]).output_dir == "traces/single-gpu"
+    assert cli.build_parser().parse_args([CMD]).output_dir == "demo/example-traces/single-gpu"
 
 
 def test_each_config_writes_its_own_run_directory(tmp_path):
     runs = et.trace_runs(64, tmp_path)
     dirs = [args[args.index("--output_dir") + 1] for _, args in runs]
     assert dirs == [str(tmp_path / sub) for sub in
-                    ["main-process", "serial", "threaded", "threaded-compiled",
+                    ["main-process", "serial", "serial-compiled", "threaded-compiled",
                      "threaded-compiled-amp"]]

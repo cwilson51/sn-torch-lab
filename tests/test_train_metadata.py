@@ -25,7 +25,13 @@ def test_metadata_fields():
     assert meta["batch_size_per_gpu"] == 128
     assert meta["dataloader_workers"] == 4
     assert meta["torch_compile"] is True
+    assert meta["pin_memory"] is False
     assert meta["profiler_schedule"] == {"skip_first": 10, "wait": 0, "warmup": 10, "active": 10}
+
+
+def test_pin_memory_metadata():
+    args = train.parse_args(["64", "--pin_memory"])
+    assert train.torch_lab_metadata(args, "cuda")["pin_memory"] is True
 
 
 def test_embed_metadata_keeps_trace(tmp_path):
