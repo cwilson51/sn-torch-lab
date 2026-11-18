@@ -33,6 +33,9 @@ def parse_args(argv=None):
     parser.add_argument("batch_size", type=int, help="Batch size used for training.")
     parser.add_argument("--nWorkers", type=int, default=1,
                         help="Number of DataLoader worker processes.")
+    parser.add_argument("--pin_memory", action="store_true",
+                        help="Pin DataLoader batches in page-locked memory and copy them "
+                             "to the GPU with non_blocking=True.")
     parser.add_argument("--nEpochs", type=int, default=1, help="Number of epochs to train.")
     parser.add_argument("--output_dir", type=str, default=".",
                         help="Directory to write the trace JSON to.")
@@ -74,6 +77,7 @@ def torch_lab_metadata(args, device_type: str) -> dict:
         "model": MODEL_NAME,
         "batch_size_per_gpu": args.batch_size,
         "dataloader_workers": args.nWorkers,
+        "pin_memory": bool(args.pin_memory),
         "torch_compile": bool(args.compile),
         "precision": precision,
         "torch_version": torch.__version__,
@@ -142,6 +146,7 @@ def main(argv=None):
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.nWorkers,
+        pin_memory=args.pin_memory,
     )
 
     model = resnet50()
@@ -193,8 +198,8 @@ def main(argv=None):
 
             with record_function("training"):
                 for i, (inputs, labels) in enumerate(tqdm(train_dataloader)):
-                    inputs = inputs.to(device)
-                    labels = labels.to(device)
+                    inputs = inputs.to(device, non_blocking=args.pin_memory)
+                    labels = labels.to(device, non_blocking=args.pin_memory)
 
                     if args.amp:
                         with torch.autocast(device_type=device.type, dtype=amp_dtype):

@@ -24,7 +24,7 @@ PROFILE_ARGS = ["--skip_first", "10", "--warmup", "10", "--active", "10"]
 RUN_SUBDIRS = {
     "Main process": "main-process",
     "Serial": "serial",
-    "Threaded": "threaded",
+    "Serial, compiled": "serial-compiled",
     "Threaded, compiled": "threaded-compiled",
     "Threaded, compiled, AMP": "threaded-compiled-amp",
 }
@@ -33,11 +33,13 @@ RUN_SUBDIRS = {
 def trace_runs(batch_size: int, output_dir: Path) -> list[tuple[str, list[str]]]:
     n = str(threaded_workers())
     configs = [
-        ("Main process", ["--nWorkers", "0"]),  # PyTorch default: no worker processes
-        ("Serial", ["--nWorkers", "1"]),
-        ("Threaded", ["--nWorkers", n]),
-        ("Threaded, compiled", ["--nWorkers", n, "--compile"]),
-        ("Threaded, compiled, AMP", ["--nWorkers", n, "--compile", "--amp"]),
+        # PyTorch defaults: no worker processes, no pinned memory.
+        ("Main process", ["--nWorkers", "0"]),
+        ("Serial", ["--nWorkers", "1", "--pin_memory"]),
+        # Compiling with one worker shows whether a faster GPU step starves for data.
+        ("Serial, compiled", ["--nWorkers", "1", "--pin_memory", "--compile"]),
+        ("Threaded, compiled", ["--nWorkers", n, "--pin_memory", "--compile"]),
+        ("Threaded, compiled, AMP", ["--nWorkers", n, "--pin_memory", "--compile", "--amp"]),
     ]
     return [
         (name, [str(batch_size), "--output_dir", str(output_dir / RUN_SUBDIRS[name]),
@@ -189,8 +191,8 @@ def add_parser(subparsers) -> None:
             "job, or offers to submit a job from an Alliance login node."
         ),
     )
-    parser.add_argument("--output-dir", default="traces/single-gpu",
-                        help="Directory for traces (default: ./traces/single-gpu).")
+    parser.add_argument("--output-dir", default="demo/example-traces/single-gpu",
+                        help="Directory for traces (default: ./demo/example-traces/single-gpu).")
     parser.add_argument("--batch-size", type=batch_size_arg, default="auto",
                         help="Training batch size, or 'auto' to pick the largest power of 2 "
                              "that fits in GPU memory, up to 512 (32 on CPU). Default: auto.")
