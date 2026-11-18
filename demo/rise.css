@@ -19,8 +19,8 @@
  */
 
 :root {
-  --slide-base: 3.1vmin;        /* body text: ~33px on a 1080p screen */
-  --slide-code: 2.2vmin;          /* code cells and code blocks */
+  --slide-base: 3.5vmin;        /* body text: ~33px on a 1080p screen */
+  --slide-code: 2.5vmin;          /* code cells and code blocks */
   --sn-blue: #2b5cb4;
   --sn-gold: #e6a300;
   --slide-ink: #1f2328;
